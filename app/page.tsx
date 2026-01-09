@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 import {
   ResponsiveContainer,
@@ -13,6 +13,17 @@ import {
   Tooltip,
   CartesianGrid,
 } from "recharts";
+
+/**
+ * eBay Excel Dashboard (Upgraded single-file version)
+ * - Reducer-driven filter/sort/paging state
+ * - Internal component split (FilterPanel / KPI / Report / Charts / Table / Costs)
+ * - Non-blocking toast notifications (replaces alert)
+ * - File parsing loading feedback
+ * - Export CSV / Export Excel (current filtered list)
+ *
+ * Drop-in replacement for your current page.tsx.
+ */
 
 type RawRow = Record<string, any>;
 
@@ -42,6 +53,22 @@ type OverviewView =
   | "trend-profit"
   | "other";
 
+type SortKey = "profit" | "payout" | "gmv" | "lot";
+type SortDir = "desc" | "asc";
+
+type TopItem = { group: string; value: number };
+type DailyPoint = { date: string; value: number };
+
+type ReportPayload = {
+  summary: string;
+  statusLine: string;
+  highlights: string[];
+  risks: string[];
+  actions: string[];
+  note: string;
+  copyText: string;
+};
+
 /** ========== 默认成本（每 1 lot 成本，人民币） ========== */
 const COST_DEFAULTS: Record<string, number> = {
   "AR/CHR": 2,
@@ -58,61 +85,101 @@ const COST_DEFAULTS: Record<string, number> = {
   "SR/HR": 3,
   Sealed: 0,
   "TAG TEAM": 0,
+  "Trainer Item / Supporter": 0,
+  "V/VMAX/VSTAR": 0,
+  "VSTAR Universe": 0,
+  "VSTAR Universe (Sealed)": 0,
+  "VSTAR Universe (Singles)": 0,
+  "VSTAR Universe (Lots)": 0,
+  "VSTAR Universe (Master Ball)": 0.7,
+  "VSTAR Universe (AR/CHR)": 2,
+  "VSTAR Universe (SR/HR)": 3,
   Other: 0,
 };
 
-/** ========== 标题分类（按你的规则） ========== */
+const LS_COST_MAP_KEY = "costMap_v2";
+const LS_ROW_OVERRIDE_KEY = "rowCostOverride_v2";
+
+/** ========== hash + 稳定行 ID ========== */
+function hashStr(s: string) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function rowId(r: Row) {
+  // 选“相对稳定”的字段：SKU+标题+付款时间+回款时间
+  // 这样你重新导入同一个 Excel，大概率能对上之前的覆盖
+  return hashStr(
+    [r.sku || "", r.name || "", r.paidAt ? r.paidAt.toISOString() : "", r.payoutAt ? r.payoutAt.toISOString() : ""].join("|")
+  );
+}
+
+/** ========== 标题分类（规则数组 + 优先级顺序） ========== */
+type TitleRule = { name: string; test: (t: string) => boolean };
+
 function classifyTitleGroup(title: string) {
   const t = (title || "").replace(/\s+/g, " ").trim();
 
-  const hasKfcPack = /\bkfc\b/i.test(t) && /\bpack(s)?\b/i.test(t);
-  const hasOcd = /\bocd\b/i.test(t);
-  const hasTagTeam = /tag\s*team/i.test(t);
-  const hasSealed = /\bsealed\b/i.test(t);
+  // 特征提取（避免规则里重复写很多 regex）
+  const has = {
+    kfc: /\bkfc\b/i.test(t),
+    sealed: /\bsealed\b/i.test(t),
+    tagTeam: /\btag\s*team\b/i.test(t),
+    trainer: /\btrainer\b/i.test(t) || /\bsupporter\b/i.test(t) || /\bitem\b/i.test(t),
+    ocd: /\bocd\b/i.test(t),
+    masterBall: /\bmaster\s*ball\b/i.test(t),
+    logoReverse: /\blogo\b/i.test(t) && /\breverse\b/i.test(t),
+    ballHolo: /\bball\b/i.test(t) && /\bholo\b/i.test(t),
+    mix: /\bmix\b/i.test(t),
 
-  const hasMasterBall = /master\s*ball/i.test(t);
-  const hasLogoReverseHolo = /logo\s*reverse\s*holo/i.test(t);
-  const hasBallHolo = /ball\s*holo/i.test(t);
-  const hasMix = /\bmix\b/i.test(t);
+    ar: /\bar\b/i.test(t),
+    chr: /\bchr\b/i.test(t),
+    sr: /\bsr\b/i.test(t),
+    hr: /\bhr\b/i.test(t),
 
-  const hasAR = /\bar\b/i.test(t);
-  const hasCHR = /\bchr\b/i.test(t);
+    rrr: /\brrr\b/i.test(t),
+    rr: /\brr\b/i.test(t),
+    vmax: /\bvmax\b/i.test(t),
 
-  const hasSR = /\bsr\b/i.test(t);
-  const hasHR = /\bhr\b/i.test(t);
+    japanese: /\bjapanese\b/i.test(t),
 
-  const hasRRR = /\brrr\b/i.test(t);
-  const hasRR = /\brr\b/i.test(t);
-  const hasVMAX = /\bvmax\b/i.test(t);
+    otherRarity:
+      /\brrrr\b/i.test(t) ||
+      /\bur\b/i.test(t) ||
+      /\bssr\b/i.test(t) ||
+      /\bsar\b/i.test(t) ||
+      /\bcsr\b/i.test(t) ||
+      /\bace\b/i.test(t) ||
+      /\bex\b/i.test(t) ||
+      /\bgold\b/i.test(t) ||
+      /\bsecret\b/i.test(t),
+  };
 
-  const isJapanese = /\bjapanese\b/i.test(t);
+  const rules: TitleRule[] = [
+    { name: "KFC Pack", test: () => has.kfc },
+    { name: "Sealed", test: () => has.sealed },
+    { name: "TAG TEAM", test: () => has.tagTeam },
+    { name: "Trainer Item / Supporter", test: () => has.trainer },
+    { name: "OCD", test: () => has.ocd },
+    { name: "Master Ball", test: () => has.masterBall },
+    { name: "Logo Reverse Holo", test: () => has.logoReverse },
+    { name: "Ball Holo", test: () => has.ballHolo },
+    { name: "Mix", test: () => has.mix },
+    { name: "AR/CHR", test: () => has.ar || has.chr },
+    { name: "SR/HR", test: () => (has.sr || has.hr) && !has.ocd },
+    { name: "Japanese", test: () => has.japanese },
 
-  const hasOtherRarity =
-    /\brrrr\b/i.test(t) ||
-    /\bur\b/i.test(t) ||
-    /\bssr\b/i.test(t) ||
-    hasSR ||
-    hasHR ||
-    hasAR ||
-    hasCHR ||
-    hasTagTeam;
+    // RR / RRR / VMAX：尽量排到最后（避免被“otherRarity”误伤）
+    { name: "RRR+VMAX", test: () => has.rrr && has.vmax && !has.rr && !has.otherRarity },
+    { name: "RR+RRR", test: () => has.rr && has.rrr && !has.otherRarity },
+    { name: "RR Only", test: () => has.rr && !has.rrr && !has.otherRarity },
+  ];
 
-  if (hasKfcPack) return "KFC Pack";
-  if (hasOcd) return "OCD";
-  if (hasTagTeam) return "TAG TEAM";
-  if (hasSealed) return "Sealed";
-  if (hasMasterBall) return "Master Ball";
-  if (hasLogoReverseHolo) return "Logo Reverse Holo";
-  if (hasBallHolo) return "Ball Holo";
-  if (hasMix) return "Mix";
-  if (hasAR || hasCHR) return "AR/CHR";
-  if ((hasSR || hasHR) && !hasOcd) return "SR/HR";
-  if (isJapanese) return "Japanese";
-
-  if (hasRRR && hasVMAX && !hasRR && !hasOtherRarity) return "RRR+VMAX";
-  if (hasRR && hasRRR && !hasOtherRarity) return "RR+RRR";
-  if (hasRR && !hasRRR && !hasOtherRarity) return "RR Only";
-
+  for (const r of rules) if (r.test(t)) return r.name;
   return "Other";
 }
 
@@ -136,28 +203,6 @@ function parseLotCountFromTitle(title: string): number {
   return Math.round(n);
 }
 
-/** ========== 工具：稳定 ID（用于单条成本覆盖） ========== */
-function hashStr(str: string) {
-  let h = 5381;
-  for (let i = 0; i < str.length; i++) {
-    h = ((h << 5) + h) ^ str.charCodeAt(i);
-  }
-  return (h >>> 0).toString(16);
-}
-
-function rowId(r: Row) {
-  // 选“相对稳定”的字段：SKU+标题+付款时间+回款时间
-  // 这样你重新导入同一个 Excel，大概率能对上之前的覆盖
-  return hashStr(
-    [
-      r.sku || "",
-      r.name || "",
-      r.paidAt ? r.paidAt.toISOString() : "",
-      r.payoutAt ? r.payoutAt.toISOString() : "",
-    ].join("|")
-  );
-}
-
 /** ========== Excel 表头匹配 + 数值/日期解析 ========== */
 function normHeader(h: string) {
   return String(h ?? "")
@@ -168,27 +213,23 @@ function normHeader(h: string) {
     .replace(/¥/g, "CNY");
 }
 
-function pickKey(obj: RawRow, candidates: string[]) {
-  const keys = Object.keys(obj);
-  const normKeys = keys.map((k) => [k, normHeader(k)] as const);
+function pickKey(r: RawRow, candidates: string[]) {
+  const keys = Object.keys(r);
+  const normKeys = new Map<string, string>();
+  keys.forEach((k) => normKeys.set(normHeader(k), k));
 
   for (const c of candidates) {
-    const nc = normHeader(c);
-    const hit = normKeys.find(([, nk]) => nk === nc);
-    if (hit) return hit[0];
+    const k = normKeys.get(normHeader(c));
+    if (k) return k;
   }
-  for (const c of candidates) {
-    const nc = normHeader(c);
-    const hit = normKeys.find(([, nk]) => nk.includes(nc) || nc.includes(nk));
-    if (hit) return hit[0];
-  }
-  return undefined;
+  return "";
 }
 
-function toNumber(v: any) {
-  if (v === null || v === undefined || v === "") return 0;
+function toNumber(v: any): number {
+  if (v === null || v === undefined) return 0;
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
-  const s = String(v).replace(/,/g, "").replace(/[^\d.-]/g, "");
+  const s = String(v).trim().replace(/,/g, "");
+  if (!s) return 0;
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
@@ -218,7 +259,7 @@ function parseYmd(ymd: string): Date | null {
   if (!ymd) return null;
   const [y, m, d] = ymd.split("-").map(Number);
   if (!y || !m || !d) return null;
-  return new Date(y, m - 1, d, 0, 0, 0, 0);
+  return new Date(y, m - 1, d);
 }
 function endOfDay(d: Date) {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
@@ -229,12 +270,7 @@ function addDays(d: Date, n: number) {
   return x;
 }
 
-function filterByDate(
-  input: Row[],
-  getDt: (r: Row) => Date | null,
-  startYmd: string,
-  endYmd: string
-) {
+function filterByDate(input: Row[], getDt: (r: Row) => Date | null, startYmd: string, endYmd: string) {
   const start = parseYmd(startYmd);
   const end = endYmd ? endOfDay(parseYmd(endYmd)!) : null;
   if (!start && !end) return input;
@@ -254,7 +290,7 @@ function buildDailySeries(
   getVal: (r: Row) => number,
   startYmd: string,
   endYmd: string
-) {
+): DailyPoint[] {
   if (!input.length) return [];
 
   let minD: Date | null = null;
@@ -280,7 +316,7 @@ function buildDailySeries(
     map.set(key, (map.get(key) ?? 0) + (getVal(r) || 0));
   });
 
-  const out: Array<{ date: string; value: number }> = [];
+  const out: DailyPoint[] = [];
   for (let d = new Date(start); d <= end; d = addDays(d, 1)) {
     const key = dayKey(d);
     out.push({ date: key, value: Number(((map.get(key) ?? 0) as number).toFixed(2)) });
@@ -288,15 +324,120 @@ function buildDailySeries(
   return out;
 }
 
-/** ========== 统计工具 ========== */
-function money(n: number, digits = 0) {
+/** ========== 数值工具 ========== */
+function money(n: number, digits = 2) {
   if (!Number.isFinite(n)) return "0";
-  return n.toLocaleString(undefined, {
-    maximumFractionDigits: digits,
-    minimumFractionDigits: digits,
-  });
+  return n.toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
+}
+function median(arr: number[]) {
+  if (!arr.length) return 0;
+  const a = [...arr].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  if (a.length % 2 === 0) return (a[mid - 1] + a[mid]) / 2;
+  return a[mid];
+}
+function percentile(arr: number[], p: number) {
+  if (!arr.length) return 0;
+  const a = [...arr].sort((x, y) => x - y);
+  const idx = Math.min(a.length - 1, Math.max(0, Math.floor((a.length - 1) * p)));
+  return a[idx];
 }
 
+/** ========== 通用 Hook：localStorage 状态 ========== */
+function useLocalStorageState<T>(key: string, initial: T) {
+  const [value, setValue] = useState<T>(initial);
+  const loadedRef = useRef(false);
+
+  useEffect(() => {
+    // 只在客户端读取
+    try {
+      const raw = typeof window !== "undefined" ? window.localStorage.getItem(key) : null;
+      if (raw) {
+        setValue(JSON.parse(raw) as T);
+      }
+    } catch {
+      // ignore
+    } finally {
+      loadedRef.current = true;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    try {
+      if (typeof window !== "undefined") window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      // ignore
+    }
+  }, [key, value]);
+
+  return [value, setValue] as const;
+}
+
+/** ========== Toast ========== */
+type ToastType = "success" | "error" | "info";
+type ToastItem = { id: string; type: ToastType; message: string };
+
+function useToast() {
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+  const push = (type: ToastType, message: string) => {
+    const id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    setToasts((prev) => [...prev, { id, type, message }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3200);
+  };
+
+  const remove = (id: string) => setToasts((prev) => prev.filter((t) => t.id !== id));
+
+  return { toasts, push, remove };
+}
+
+function ToastStack({ toasts, onClose }: { toasts: ToastItem[]; onClose: (id: string) => void }) {
+  if (!toasts.length) return null;
+  return (
+    <div style={{ position: "fixed", right: 16, top: 16, zIndex: 9999, display: "grid", gap: 10, width: 360, maxWidth: "calc(100vw - 32px)" }}>
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          style={{
+            borderRadius: 14,
+            border: "1px solid #e2e8f0",
+            background: "#fff",
+            padding: 12,
+            boxShadow: "0 10px 25px rgba(0,0,0,0.08)",
+            display: "grid",
+            gap: 8,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: 99,
+                background:
+                  t.type === "success" ? "#16a34a" : t.type === "error" ? "#dc2626" : "#2563eb",
+              }}
+            />
+            <div style={{ fontWeight: 800, color: "#0f172a" }}>
+              {t.type === "success" ? "成功" : t.type === "error" ? "出错" : "提示"}
+            </div>
+            <div style={{ flex: 1 }} />
+            <button onClick={() => onClose(t.id)} style={btnGhostSm()}>
+              ✕
+            </button>
+          </div>
+          <div style={{ color: "#334155", lineHeight: 1.4, fontSize: 13 }}>{t.message}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** ========== Styling helpers (still inline, but centralized) ========== */
 function smallStyle(): React.CSSProperties {
   return { color: "#64748b", fontSize: 12 };
 }
@@ -314,139 +455,869 @@ function pill(active = false): React.CSSProperties {
     background: active ? "#0f172a" : "#fff",
     color: active ? "#fff" : "#0f172a",
     cursor: "pointer",
-    fontSize: 13,
     fontWeight: 800,
-    whiteSpace: "nowrap",
+    fontSize: 12,
   };
 }
 function inputBase(): React.CSSProperties {
-  return { padding: 10, borderRadius: 10, border: "1px solid #e2e8f0", width: "100%" };
+  return {
+    width: "100%",
+    padding: "8px 10px",
+    borderRadius: 10,
+    border: "1px solid #e2e8f0",
+    outline: "none",
+    fontSize: 13,
+  };
+}
+function btnGhostSm(): React.CSSProperties {
+  return {
+    border: "1px solid #e2e8f0",
+    background: "#fff",
+    borderRadius: 10,
+    padding: "6px 10px",
+    cursor: "pointer",
+    fontWeight: 800,
+    fontSize: 12,
+    color: "#0f172a",
+  };
+}
+function btnPrimarySm(): React.CSSProperties {
+  return {
+    border: "1px solid #0f172a",
+    background: "#0f172a",
+    borderRadius: 10,
+    padding: "6px 10px",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 12,
+    color: "#fff",
+  };
 }
 
-function median(arr: number[]) {
-  if (!arr.length) return 0;
-  const a = [...arr].sort((x, y) => x - y);
-  const mid = Math.floor(a.length / 2);
-  if (a.length % 2 === 0) return (a[mid - 1] + a[mid]) / 2;
-  return a[mid];
+/** ========== Filters reducer ========== */
+type FiltersState = {
+  status: string;
+  category: string;
+  group: string;
+  q: string;
+
+  paidStartYmd: string;
+  paidEndYmd: string;
+  payoutStartYmd: string;
+  payoutEndYmd: string;
+
+  sortKey: SortKey;
+  sortDir: SortDir;
+  page: number;
+  pageSize: number;
+};
+
+const initialFilters: FiltersState = {
+  status: "全部",
+  category: "全部",
+  group: "全部",
+  q: "",
+  paidStartYmd: "",
+  paidEndYmd: "",
+  payoutStartYmd: "",
+  payoutEndYmd: "",
+  sortKey: "profit",
+  sortDir: "desc",
+  page: 1,
+  pageSize: 50,
+};
+
+type FiltersAction =
+  | { type: "set"; key: keyof FiltersState; value: any }
+  | { type: "reset" }
+  | { type: "setPage"; page: number };
+
+function filtersReducer(state: FiltersState, action: FiltersAction): FiltersState {
+  if (action.type === "reset") return { ...initialFilters };
+  if (action.type === "setPage") return { ...state, page: Math.max(1, action.page) };
+
+  const next = { ...state, [action.key]: action.value } as FiltersState;
+
+  // 改筛选 / 排序 -> 重置到第一页（删掉以前那条依赖很长的 useEffect）
+  const resetsPageKeys: Array<keyof FiltersState> = [
+    "status",
+    "category",
+    "group",
+    "q",
+    "paidStartYmd",
+    "paidEndYmd",
+    "payoutStartYmd",
+    "payoutEndYmd",
+    "sortKey",
+    "sortDir",
+    "pageSize",
+  ];
+
+  if (resetsPageKeys.includes(action.key)) next.page = 1;
+  return next;
 }
-function percentile(arr: number[], p: number) {
-  if (!arr.length) return 0;
-  const a = [...arr].sort((x, y) => x - y);
-  const idx = Math.min(a.length - 1, Math.max(0, Math.floor((a.length - 1) * p)));
-  return a[idx];
+
+/** ========== Excel parsing (single responsibility) ========== */
+function mapRawRowsToRows(raw: RawRow[]): Row[] {
+  if (!raw.length) return [];
+
+  // 只对第一行做一次表头匹配，然后复用，避免每行都扫描
+  const sample = raw[0];
+  const kSku = pickKey(sample, ["库存sku", "SKU", "sku"]);
+  const kName = pickKey(sample, ["商品名称", "标题", "名称"]);
+  const kCat = pickKey(sample, ["卡片类目", "类目"]);
+  const kStatus = pickKey(sample, ["回款状态"]);
+
+  const kQty = pickKey(sample, ["售出数量", "数量"]);
+  const kGmv = pickKey(sample, ["成交金额($)", "成交金额USD", "成交金额"]);
+  const kPayout = pickKey(sample, ["回款金额(¥)", "回款金额CNY", "回款金额"]);
+
+  const kPaidAt = pickKey(sample, ["eBay用户付款时间", "付款时间"]);
+  const kPayoutAt = pickKey(sample, ["回款时间"]);
+
+  return raw.map((r) => {
+    const sku = kSku ? String(r[kSku]).trim() : "";
+    const name = kName ? String(r[kName]).trim() : "";
+    const cat = kCat ? String(r[kCat]).trim() : "";
+    const payoutStatus = kStatus ? String(r[kStatus]).trim() : "未知";
+
+    return {
+      sku,
+      name,
+      category: cat,
+      payoutStatus,
+      soldQty: toNumber(kQty ? r[kQty] : 0),
+      gmvUsd: toNumber(kGmv ? r[kGmv] : 0),
+      payoutCny: toNumber(kPayout ? r[kPayout] : 0),
+      paidAt: kPaidAt ? excelDateToJSDate(r[kPaidAt]) : null,
+      payoutAt: kPayoutAt ? excelDateToJSDate(r[kPayoutAt]) : null,
+      titleGroup: classifyTitleGroup(name),
+    };
+  });
 }
 
-export default function Page() {
-  const [tab, setTab] = useState<TabKey>("overview");
-  const [overviewView, setOverviewView] = useState<OverviewView>("top10-profit");
-  const [rows, setRows] = useState<Row[]>([]);
+/** ========== Export helpers ========== */
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
-  // 两套日期范围：GMV 用付款时间；回款/利润 用回款时间
-  const [paidStartYmd, setPaidStartYmd] = useState("");
-  const [paidEndYmd, setPaidEndYmd] = useState("");
-  const [payoutStartYmd, setPayoutStartYmd] = useState("");
-  const [payoutEndYmd, setPayoutEndYmd] = useState("");
+function exportRowsToCSV(rows: Row[], costPerLotForRow: (r: Row) => number) {
+  const headers = [
+    "titleGroup",
+    "sku",
+    "name",
+    "category",
+    "payoutStatus",
+    "soldQty",
+    "lotCount",
+    "gmvUsd",
+    "payoutCny",
+    "costPerLotCny",
+    "totalCostCny",
+    "profitCny",
+    "paidAt",
+    "payoutAt",
+  ];
 
-  // 共用筛选
-  const [status, setStatus] = useState("全部");
-  const [category, setCategory] = useState("全部");
-  const [group, setGroup] = useState("全部");
-  const [q, setQ] = useState("");
+  const lines = [headers.join(",")];
 
-  /** 分类成本表（可编辑） */
-  const [costMap, setCostMap] = useState<Record<string, number>>(() => {
-    if (typeof window === "undefined") return COST_DEFAULTS;
-    try {
-      const raw = localStorage.getItem("costMap_v5");
-      if (raw) return { ...COST_DEFAULTS, ...JSON.parse(raw) };
-    } catch {}
-    return COST_DEFAULTS;
+  rows.forEach((r) => {
+    const lot = parseLotCountFromTitle(r.name);
+    const cpl = costPerLotForRow(r);
+    const totalCost = cpl * lot;
+    const profit = r.payoutCny ? r.payoutCny - totalCost : 0;
+
+    const values: any[] = [
+      r.titleGroup,
+      r.sku,
+      r.name,
+      r.category,
+      r.payoutStatus,
+      r.soldQty,
+      lot,
+      r.gmvUsd,
+      r.payoutCny,
+      cpl,
+      totalCost,
+      profit,
+      r.paidAt ? r.paidAt.toISOString() : "",
+      r.payoutAt ? r.payoutAt.toISOString() : "",
+    ];
+
+    const escaped = values.map((v) => {
+      const s = String(v ?? "");
+      // CSV escape: quote if contains comma/quote/newline
+      if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    });
+
+    lines.push(escaped.join(","));
   });
 
-  useEffect(() => {
-    try {
-      localStorage.setItem("costMap_v5", JSON.stringify(costMap));
-    } catch {}
-  }, [costMap]);
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  downloadBlob(blob, `ebay_dashboard_${new Date().toISOString().slice(0, 10)}.csv`);
+}
 
-  /** 单条成本覆盖：key=rowId -> 成本(¥/lot) */
-  const [rowCostOverride, setRowCostOverride] = useState<Record<string, number>>(() => {
-    if (typeof window === "undefined") return {};
-    try {
-      const raw = localStorage.getItem("rowCostOverride_v2");
-      return raw ? JSON.parse(raw) : {};
-    } catch {
-      return {};
-    }
+function exportRowsToExcel(rows: Row[], costPerLotForRow: (r: Row) => number) {
+  const data = rows.map((r) => {
+    const lot = parseLotCountFromTitle(r.name);
+    const cpl = costPerLotForRow(r);
+    const totalCost = cpl * lot;
+    const profit = r.payoutCny ? r.payoutCny - totalCost : 0;
+
+    return {
+      titleGroup: r.titleGroup,
+      sku: r.sku,
+      name: r.name,
+      category: r.category,
+      payoutStatus: r.payoutStatus,
+      soldQty: r.soldQty,
+      lotCount: lot,
+      gmvUsd: r.gmvUsd,
+      payoutCny: r.payoutCny,
+      costPerLotCny: cpl,
+      totalCostCny: totalCost,
+      profitCny: profit,
+      paidAt: r.paidAt ? r.paidAt.toISOString() : "",
+      payoutAt: r.payoutAt ? r.payoutAt.toISOString() : "",
+    };
   });
 
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Orders");
+  XLSX.writeFile(wb, `ebay_dashboard_${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+/** ========== UI Components ========== */
+function KpiCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div style={{ ...card(), ...cardPad() }}>
+      <div style={smallStyle()}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 950, marginTop: 8, color: "#0f172a" }}>{value}</div>
+      {sub ? <div style={{ marginTop: 6, ...smallStyle() }}>{sub}</div> : null}
+    </div>
+  );
+}
+
+function KpiGrid({ kpi }: { kpi: { baseCount: number; listCount: number; gmvUsd: number; payoutCny: number; totalCost: number; totalProfit: number; margin: number } }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 12 }}>
+      <KpiCard label="订单行数（基础/筛选）" value={`${kpi.listCount} / ${kpi.baseCount}`} sub="基础：不含日期；筛选：含两套日期范围" />
+      <KpiCard label="GMV（付款口径）" value={`$${money(kpi.gmvUsd)}`} />
+      <KpiCard label="回款（回款口径）" value={`¥${money(kpi.payoutCny)}`} />
+      <KpiCard label="利润 / 利润率" value={`¥${money(kpi.totalProfit)}`} sub={`${(kpi.margin * 100).toFixed(1)}%`} />
+    </div>
+  );
+}
+
+function ReportCard({ report, onCopy, isDisabled }: { report: ReportPayload; onCopy: () => void; isDisabled?: boolean }) {
+  return (
+    <div style={{ ...card(), ...cardPad(), display: "grid", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ fontWeight: 950 }}>自动分析报告</div>
+        <div style={{ flex: 1 }} />
+        <button onClick={onCopy} disabled={isDisabled} style={isDisabled ? { ...btnGhostSm(), opacity: 0.5, cursor: "not-allowed" } : btnPrimarySm()}>
+          复制报告
+        </button>
+      </div>
+
+      <div style={{ color: "#0f172a", lineHeight: 1.5 }}>{report.summary}</div>
+      <div style={{ ...smallStyle() }}>{report.statusLine}</div>
+      <div style={{ ...smallStyle() }}>{report.note}</div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12, marginTop: 4 }}>
+        <div>
+          <div style={{ fontWeight: 900, marginBottom: 6 }}>亮点</div>
+          <ul style={{ margin: 0, paddingLeft: 16 }}>
+            {report.highlights.length ? report.highlights.map((x, i) => <li key={i} style={{ marginBottom: 6, color: "#0f172a", fontSize: 13 }}>{x}</li>) : <li style={{ color: "#64748b", fontSize: 13 }}>暂无</li>}
+          </ul>
+        </div>
+        <div>
+          <div style={{ fontWeight: 900, marginBottom: 6 }}>风险</div>
+          <ul style={{ margin: 0, paddingLeft: 16 }}>
+            {report.risks.length ? report.risks.map((x, i) => <li key={i} style={{ marginBottom: 6, color: "#0f172a", fontSize: 13 }}>{x}</li>) : <li style={{ color: "#64748b", fontSize: 13 }}>暂无</li>}
+          </ul>
+        </div>
+        <div>
+          <div style={{ fontWeight: 900, marginBottom: 6 }}>建议动作</div>
+          <ul style={{ margin: 0, paddingLeft: 16 }}>
+            {report.actions.length ? report.actions.map((x, i) => <li key={i} style={{ marginBottom: 6, color: "#0f172a", fontSize: 13 }}>{x}</li>) : <li style={{ color: "#64748b", fontSize: 13 }}>暂无</li>}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FilterPanel(props: {
+  isParsing: boolean;
+  onFile: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onExportCSV: () => void;
+  onExportExcel: () => void;
+  exportDisabled: boolean;
+
+  filters: FiltersState;
+  dispatch: React.Dispatch<FiltersAction>;
+  statusOptions: string[];
+  categoryOptions: string[];
+  groupOptions: string[];
+  onReset: () => void;
+}) {
+  const { isParsing, onFile, onExportCSV, onExportExcel, exportDisabled, filters, dispatch, statusOptions, categoryOptions, groupOptions, onReset } = props;
+
+  return (
+    <div style={{ ...card(), ...cardPad(), position: "sticky", top: 16, height: "fit-content" }}>
+      <div style={{ fontWeight: 950 }}>控制台</div>
+
+      <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
+        <label>
+          <div style={smallStyle()}>上传 Excel</div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 6 }}>
+            <input type="file" accept=".xlsx,.xls" onChange={onFile} disabled={isParsing} />
+            {isParsing ? <div style={{ ...smallStyle() }}>解析中…</div> : null}
+          </div>
+        </label>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button onClick={onExportCSV} disabled={exportDisabled} style={exportDisabled ? { ...btnGhostSm(), opacity: 0.5, cursor: "not-allowed" } : btnGhostSm()}>
+            导出 CSV（筛选后）
+          </button>
+          <button onClick={onExportExcel} disabled={exportDisabled} style={exportDisabled ? { ...btnGhostSm(), opacity: 0.5, cursor: "not-allowed" } : btnGhostSm()}>
+            导出 Excel（筛选后）
+          </button>
+          <button onClick={onReset} style={btnGhostSm()}>
+            清空筛选
+          </button>
+        </div>
+
+        <label>
+          <div style={smallStyle()}>回款状态</div>
+          <select value={filters.status} onChange={(e) => dispatch({ type: "set", key: "status", value: e.target.value })} style={{ ...inputBase(), marginTop: 6 }}>
+            {statusOptions.map((x) => (
+              <option key={x} value={x}>
+                {x}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          <div style={smallStyle()}>类目</div>
+          <select value={filters.category} onChange={(e) => dispatch({ type: "set", key: "category", value: e.target.value })} style={{ ...inputBase(), marginTop: 6 }}>
+            {categoryOptions.map((x) => (
+              <option key={x} value={x}>
+                {x}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          <div style={smallStyle()}>标题分类</div>
+          <select value={filters.group} onChange={(e) => dispatch({ type: "set", key: "group", value: e.target.value })} style={{ ...inputBase(), marginTop: 6 }}>
+            {groupOptions.map((x) => (
+              <option key={x} value={x}>
+                {x}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
+          <div style={smallStyle()}>搜索（SKU/标题）</div>
+          <input value={filters.q} onChange={(e) => dispatch({ type: "set", key: "q", value: e.target.value })} placeholder="输入关键词…" style={{ ...inputBase(), marginTop: 6 }} />
+        </label>
+
+        <label>
+          <div style={smallStyle()}>付款时间范围（GMV）</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 6 }}>
+            <input type="date" value={filters.paidStartYmd} onChange={(e) => dispatch({ type: "set", key: "paidStartYmd", value: e.target.value })} style={inputBase()} />
+            <input type="date" value={filters.paidEndYmd} onChange={(e) => dispatch({ type: "set", key: "paidEndYmd", value: e.target.value })} style={inputBase()} />
+          </div>
+        </label>
+
+        <label>
+          <div style={smallStyle()}>回款时间范围（回款/利润）</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 6 }}>
+            <input type="date" value={filters.payoutStartYmd} onChange={(e) => dispatch({ type: "set", key: "payoutStartYmd", value: e.target.value })} style={inputBase()} />
+            <input type="date" value={filters.payoutEndYmd} onChange={(e) => dispatch({ type: "set", key: "payoutEndYmd", value: e.target.value })} style={inputBase()} />
+          </div>
+        </label>
+      </div>
+
+      <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #f1f5f9" }}>
+        <div style={smallStyle()}>
+          口径：GMV 按【付款时间】；回款/利润按【回款时间】（两套时间范围互不影响）。
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OverviewCharts(props: {
+  overviewView: OverviewView;
+  setOverviewView: (v: OverviewView) => void;
+  top10: { gmv: TopItem[]; payout: TopItem[]; profit: TopItem[] };
+  gmvSeries: DailyPoint[];
+  payoutSeries: DailyPoint[];
+  profitSeries: DailyPoint[];
+  otherRows: Row[];
+}) {
+  const { overviewView, setOverviewView, top10, gmvSeries, payoutSeries, profitSeries, otherRows } = props;
+
+  const Views: Array<{ key: OverviewView; label: string }> = [
+    { key: "top10-profit", label: "Top10 利润" },
+    { key: "top10-payout", label: "Top10 回款" },
+    { key: "top10-gmv", label: "Top10 GMV" },
+    { key: "trend-profit", label: "趋势：利润" },
+    { key: "trend-payout", label: "趋势：回款" },
+    { key: "trend-gmv", label: "趋势：GMV" },
+    { key: "other", label: "Other 清单" },
+  ];
+
+  const chartCard: React.CSSProperties = { ...card(), ...cardPad(), minHeight: 420, display: "grid", gridTemplateRows: "auto 1fr" };
+
+  return (
+    <div style={chartCard}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+        {Views.map((v) => (
+          <button key={v.key} onClick={() => setOverviewView(v.key)} style={pill(overviewView === v.key)}>
+            {v.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ height: 360 }}>
+        {overviewView === "top10-profit" && (
+          <>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>利润 Top10（回款口径）</div>
+            <ResponsiveContainer>
+              <BarChart data={top10.profit} margin={{ left: 10, right: 20, bottom: 30 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="group" angle={-30} textAnchor="end" height={60} interval={0} />
+                <YAxis />
+                <Tooltip />
+                <Bar dataKey="value" name="利润(¥)" fill="#0f172a" />
+              </BarChart>
+            </ResponsiveContainer>
+          </>
+        )}
+
+        {overviewView === "top10-payout" && (
+          <>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>回款 Top10（回款口径）</div>
+            <ResponsiveContainer>
+              <BarChart data={top10.payout} margin={{ left: 10, right: 20, bottom: 30 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="group" angle={-30} textAnchor="end" height={60} interval={0} />
+                <YAxis />
+                <Tooltip />
+                <Bar dataKey="value" name="回款(¥)" fill="#0f766e" />
+              </BarChart>
+            </ResponsiveContainer>
+          </>
+        )}
+
+        {overviewView === "top10-gmv" && (
+          <>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>GMV Top10（付款口径）</div>
+            <ResponsiveContainer>
+              <BarChart data={top10.gmv} margin={{ left: 10, right: 20, bottom: 30 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="group" angle={-30} textAnchor="end" height={60} interval={0} />
+                <YAxis />
+                <Tooltip />
+                <Bar dataKey="value" name="GMV($)" fill="#2563eb" />
+              </BarChart>
+            </ResponsiveContainer>
+          </>
+        )}
+
+        {overviewView === "trend-gmv" && (
+          <>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>GMV 按天趋势（付款时间）</div>
+            <ResponsiveContainer>
+              <LineChart data={gmvSeries} margin={{ left: 10, right: 20, bottom: 30 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" angle={-30} textAnchor="end" height={60} interval="preserveStartEnd" />
+                <YAxis />
+                <Tooltip />
+                <Line type="monotone" dataKey="value" name="GMV($)" stroke="#111827" dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </>
+        )}
+
+        {overviewView === "trend-payout" && (
+          <>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>回款 按天趋势（回款时间）</div>
+            <ResponsiveContainer>
+              <LineChart data={payoutSeries} margin={{ left: 10, right: 20, bottom: 30 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" angle={-30} textAnchor="end" height={60} interval="preserveStartEnd" />
+                <YAxis />
+                <Tooltip />
+                <Line type="monotone" dataKey="value" name="回款(¥)" stroke="#0f766e" dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </>
+        )}
+
+        {overviewView === "trend-profit" && (
+          <>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>利润 按天趋势（回款时间）</div>
+            <ResponsiveContainer>
+              <LineChart data={profitSeries} margin={{ left: 10, right: 20, bottom: 30 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" angle={-30} textAnchor="end" height={60} interval="preserveStartEnd" />
+                <YAxis />
+                <Tooltip />
+                <Line type="monotone" dataKey="value" name="利润(¥)" stroke="#0f172a" dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </>
+        )}
+
+        {overviewView === "other" && (
+          <>
+            <div style={{ fontWeight: 900, marginBottom: 8 }}>Other（最多展示 200 行）</div>
+            <div style={{ maxHeight: 330, overflow: "auto", border: "1px solid #f1f5f9", borderRadius: 12 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ background: "#f8fafc" }}>
+                    <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #f1f5f9" }}>SKU</th>
+                    <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #f1f5f9" }}>标题</th>
+                    <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #f1f5f9" }}>类目</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {otherRows.map((r) => (
+                    <tr key={rowId(r)}>
+                      <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.sku}</td>
+                      <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9" }}>{r.name}</td>
+                      <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.category}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function OrdersTable(props: {
+  rows: Row[];
+  filters: FiltersState;
+  dispatch: React.Dispatch<FiltersAction>;
+
+  totalRows: number;
+  pagedRows: Row[];
+
+  costPerLotForRow: (r: Row) => number;
+  totalCostOf: (r: Row) => number;
+  profitOf: (r: Row) => number;
+
+  rowCostOverride: Record<string, number>;
+  setRowCostOverride: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+}) {
+  const { rows, filters, dispatch, totalRows, pagedRows, costPerLotForRow, totalCostOf, profitOf, rowCostOverride, setRowCostOverride } = props;
+
+  const totalPages = Math.max(1, Math.ceil(totalRows / filters.pageSize));
+  const page = Math.min(filters.page, totalPages);
+
   useEffect(() => {
-    try {
-      localStorage.setItem("rowCostOverride_v2", JSON.stringify(rowCostOverride));
-    } catch {}
-  }, [rowCostOverride]);
+    if (filters.page !== page) dispatch({ type: "setPage", page });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page]);
 
-  // 成本计算：优先单条覆盖，否则用分类默认
-  const lotCountOf = (r: Row) => parseLotCountFromTitle(r.name);
-  const costPerLotOfGroup = (g: string) => (Number.isFinite(costMap[g]) ? Number(costMap[g]) : 0);
+  const headerCell: React.CSSProperties = { padding: 10, background: "#f8fafc", borderBottom: "1px solid #e2e8f0", fontSize: 12, fontWeight: 900, color: "#0f172a", textAlign: "left" };
 
-  const costPerLotForRow = (r: Row) => {
-    const id = rowId(r);
-    const v = rowCostOverride[id];
-    return Number.isFinite(v) ? Number(v) : costPerLotOfGroup(r.titleGroup);
+  const thSortable = (key: SortKey, label: string) => {
+    const active = filters.sortKey === key;
+    const dir = active ? filters.sortDir : "desc";
+    const icon = active ? (dir === "asc" ? "↑" : "↓") : "";
+    return (
+      <button
+        onClick={() => {
+          if (!active) dispatch({ type: "set", key: "sortKey", value: key });
+          else dispatch({ type: "set", key: "sortDir", value: dir === "asc" ? "desc" : "asc" });
+        }}
+        style={{ border: "none", background: "transparent", cursor: "pointer", fontWeight: 900, fontSize: 12, color: "#0f172a" }}
+      >
+        {label} {icon}
+      </button>
+    );
   };
 
-  const totalCostOf = (r: Row) => costPerLotForRow(r) * lotCountOf(r);
-  const totalCostOfDefault = (r: Row) => costPerLotOfGroup(r.titleGroup) * lotCountOf(r);
+  return (
+    <div style={{ ...card(), ...cardPad() }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+        <div style={{ fontWeight: 950 }}>订单明细</div>
+        <div style={{ ...smallStyle() }}>（共 {rows.length} 行；当前筛选 {totalRows} 行）</div>
+        <div style={{ flex: 1 }} />
 
-  const profitOf = (r: Row) => (r.payoutCny ? r.payoutCny - totalCostOf(r) : 0);
-  const profitOfDefault = (r: Row) => (r.payoutCny ? r.payoutCny - totalCostOfDefault(r) : 0);
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div style={smallStyle()}>每页</div>
+          <select value={filters.pageSize} onChange={(e) => dispatch({ type: "set", key: "pageSize", value: Number(e.target.value) })} style={{ ...inputBase(), width: 90 }}>
+            {[20, 50, 100, 200].map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+
+          <button onClick={() => dispatch({ type: "setPage", page: Math.max(1, page - 1) })} style={btnGhostSm()} disabled={page <= 1}>
+            上一页
+          </button>
+          <div style={{ ...smallStyle(), minWidth: 120, textAlign: "center" }}>
+            第 {page} / {totalPages} 页
+          </div>
+          <button onClick={() => dispatch({ type: "setPage", page: Math.min(totalPages, page + 1) })} style={btnGhostSm()} disabled={page >= totalPages}>
+            下一页
+          </button>
+        </div>
+      </div>
+
+      <div style={{ border: "1px solid #f1f5f9", borderRadius: 12, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>
+          <thead>
+            <tr>
+              <th style={headerCell}>分类</th>
+              <th style={headerCell}>SKU</th>
+              <th style={headerCell}>标题</th>
+              <th style={{ ...headerCell, textAlign: "right" }}>{thSortable("lot", "Lot")}</th>
+              <th style={{ ...headerCell, textAlign: "right" }}>{thSortable("gmv", "GMV($)")}</th>
+              <th style={{ ...headerCell, textAlign: "right" }}>{thSortable("payout", "回款(¥)")}</th>
+              <th style={{ ...headerCell, textAlign: "right" }}>成本¥/lot（可覆盖）</th>
+              <th style={{ ...headerCell, textAlign: "right" }}>总成本(¥)</th>
+              <th style={{ ...headerCell, textAlign: "right" }}>{thSortable("profit", "利润(¥)")}</th>
+              <th style={headerCell}>回款状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pagedRows.map((r) => {
+              const id = rowId(r);
+              const lot = parseLotCountFromTitle(r.name);
+              const cpl = costPerLotForRow(r);
+              const cTotal = totalCostOf(r);
+              const p = profitOf(r);
+              const overrideVal = rowCostOverride[id];
+
+              return (
+                <tr key={id}>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.titleGroup}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.sku}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9" }}>{r.name}</td>
+
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>{lot}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>${money(r.gmvUsd)}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>¥{money(r.payoutCny)}</td>
+
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>
+                    <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={Number.isFinite(overrideVal) ? overrideVal : ""}
+                        placeholder={String(cpl)}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setRowCostOverride((prev) => {
+                            const next = { ...prev };
+                            if (v === "" || !Number.isFinite(Number(v))) delete next[id];
+                            else next[id] = Number(v);
+                            return next;
+                          });
+                        }}
+                        style={{ ...inputBase(), width: 120, textAlign: "right" }}
+                      />
+                      {Number.isFinite(overrideVal) ? (
+                        <button
+                          onClick={() => {
+                            setRowCostOverride((prev) => {
+                              const next = { ...prev };
+                              delete next[id];
+                              return next;
+                            });
+                          }}
+                          style={btnGhostSm()}
+                        >
+                          还原
+                        </button>
+                      ) : null}
+                    </div>
+                  </td>
+
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>¥{money(cTotal)}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right", fontWeight: 900, color: p >= 0 ? "#0f172a" : "#dc2626" }}>¥{money(p)}</td>
+                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.payoutStatus || "未知"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ marginTop: 10, ...smallStyle() }}>
+        提示：成本优先使用“单条覆盖”，否则使用“分类默认成本”。覆盖会自动持久化到本地浏览器（localStorage）。
+      </div>
+    </div>
+  );
+}
+
+function CostsPanel(props: {
+  costMap: Record<string, number>;
+  setCostMap: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+  groupOptions: string[];
+  rowCostOverride: Record<string, number>;
+  setRowCostOverride: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+}) {
+  const { costMap, setCostMap, groupOptions, rowCostOverride, setRowCostOverride } = props;
+
+  const groups = useMemo(() => {
+    // 让没有出现在数据里的默认组也能看到
+    const s = new Set<string>(Object.keys(COST_DEFAULTS));
+    groupOptions.forEach((g) => g !== "全部" && s.add(g));
+    s.delete("全部");
+    return Array.from(s).sort();
+  }, [groupOptions]);
+
+  const overrideCount = Object.keys(rowCostOverride).length;
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 12 }}>
+      <div style={{ ...card(), ...cardPad() }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+          <div style={{ fontWeight: 950 }}>分类默认成本（¥ / lot）</div>
+          <div style={{ ...smallStyle() }}>修改后会影响利润计算（并自动保存到本地）</div>
+        </div>
+
+        <div style={{ border: "1px solid #f1f5f9", borderRadius: 12, overflow: "hidden" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ background: "#f8fafc" }}>
+                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #f1f5f9" }}>分类</th>
+                <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #f1f5f9" }}>默认成本</th>
+              </tr>
+            </thead>
+            <tbody>
+              {groups.map((g) => {
+                const v = Number.isFinite(costMap[g]) ? Number(costMap[g]) : 0;
+                return (
+                  <tr key={g}>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{g}</td>
+                    <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={v}
+                        onChange={(e) => {
+                          const n = Number(e.target.value);
+                          setCostMap((prev) => ({ ...prev, [g]: Number.isFinite(n) ? n : 0 }));
+                        }}
+                        style={{ ...inputBase(), width: 140, textAlign: "right" }}
+                      />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style={{ ...card(), ...cardPad(), height: "fit-content" }}>
+        <div style={{ fontWeight: 950, marginBottom: 10 }}>单条成本覆盖</div>
+        <div style={{ ...smallStyle(), marginBottom: 10 }}>
+          当前有 {overrideCount} 条覆盖。覆盖用于处理“同分类但成本特殊”的订单。
+        </div>
+
+        <button
+          onClick={() => {
+            if (!overrideCount) return;
+            setRowCostOverride({});
+          }}
+          disabled={!overrideCount}
+          style={!overrideCount ? { ...btnGhostSm(), opacity: 0.5, cursor: "not-allowed" } : btnGhostSm()}
+        >
+          清空所有覆盖
+        </button>
+
+        <div style={{ marginTop: 12, ...smallStyle() }}>
+          说明：覆盖不会改变分类规则，只影响成本与利润口径。你重新导入同一份 Excel（字段一致）也能尽量对上覆盖。
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** ========== Main Page ========== */
+export default function Page() {
+  const { toasts, push, remove } = useToast();
+
+  const [tab, setTab] = useState<TabKey>("overview");
+  const [overviewView, setOverviewView] = useState<OverviewView>("top10-profit");
+
+  const [rows, setRows] = useState<Row[]>([]);
+  const [isParsing, setIsParsing] = useState(false);
+
+  const [filters, dispatch] = useReducer(filtersReducer, initialFilters);
+
+  const [costMap, setCostMap] = useLocalStorageState<Record<string, number>>(LS_COST_MAP_KEY, { ...COST_DEFAULTS });
+  const [rowCostOverride, setRowCostOverride] = useLocalStorageState<Record<string, number>>(LS_ROW_OVERRIDE_KEY, {});
+
+  // 成本/利润计算：优先单条覆盖，否则用分类默认
+  const calculators = useMemo(() => {
+    const lotCountOf = (r: Row) => parseLotCountFromTitle(r.name);
+    const costPerLotOfGroup = (g: string) => (Number.isFinite(costMap[g]) ? Number(costMap[g]) : 0);
+    const costPerLotForRow = (r: Row) => {
+      const id = rowId(r);
+      const v = rowCostOverride[id];
+      return Number.isFinite(v) ? Number(v) : costPerLotOfGroup(r.titleGroup);
+    };
+    const totalCostOf = (r: Row) => costPerLotForRow(r) * lotCountOf(r);
+    const totalCostOfDefault = (r: Row) => costPerLotOfGroup(r.titleGroup) * lotCountOf(r);
+    const profitOf = (r: Row) => (r.payoutCny ? r.payoutCny - totalCostOf(r) : 0);
+    const profitOfDefault = (r: Row) => (r.payoutCny ? r.payoutCny - totalCostOfDefault(r) : 0);
+    return { lotCountOf, costPerLotOfGroup, costPerLotForRow, totalCostOf, totalCostOfDefault, profitOf, profitOfDefault };
+  }, [costMap, rowCostOverride]);
 
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const buf = await file.arrayBuffer();
-    const wb = XLSX.read(buf, { type: "array" });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const raw = XLSX.utils.sheet_to_json<RawRow>(ws, { defval: "" });
+    setIsParsing(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const raw = XLSX.utils.sheet_to_json<RawRow>(ws, { defval: "" });
 
-    const mapped: Row[] = raw.map((r) => {
-      const kSku = pickKey(r, ["库存sku", "SKU", "sku"]);
-      const kName = pickKey(r, ["商品名称", "标题", "名称"]);
-      const kCat = pickKey(r, ["卡片类目", "类目"]);
-      const kStatus = pickKey(r, ["回款状态"]);
+      const mapped = mapRawRowsToRows(raw);
+      setRows(mapped);
 
-      const kQty = pickKey(r, ["售出数量", "数量"]);
-      const kGmv = pickKey(r, ["成交金额($)", "成交金额USD", "成交金额"]);
-      const kPayout = pickKey(r, ["回款金额(¥)", "回款金额CNY", "回款金额"]);
+      setTab("overview");
+      setOverviewView("top10-profit");
 
-      const kPaidAt = pickKey(r, ["eBay用户付款时间", "付款时间"]);
-      const kPayoutAt = pickKey(r, ["回款时间"]);
-
-      const sku = kSku ? String(r[kSku]).trim() : "";
-      const name = kName ? String(r[kName]).trim() : "";
-      const cat = kCat ? String(r[kCat]).trim() : "";
-      const payoutStatus = kStatus ? String(r[kStatus]).trim() : "未知";
-
-      return {
-        sku,
-        name,
-        category: cat,
-        payoutStatus,
-        soldQty: toNumber(kQty ? r[kQty] : 0),
-        gmvUsd: toNumber(kGmv ? r[kGmv] : 0),
-        payoutCny: toNumber(kPayout ? r[kPayout] : 0),
-        paidAt: kPaidAt ? excelDateToJSDate(r[kPaidAt]) : null,
-        payoutAt: kPayoutAt ? excelDateToJSDate(r[kPayoutAt]) : null,
-        titleGroup: classifyTitleGroup(name),
-      };
-    });
-
-    setRows(mapped);
-    setTab("overview");
-    setOverviewView("top10-profit");
+      push("success", `已加载 ${mapped.length} 行数据`);
+    } catch (err: any) {
+      push("error", `解析失败：${err?.message ?? String(err)}`);
+    } finally {
+      setIsParsing(false);
+      // 允许再次选择同一文件
+      e.target.value = "";
+    }
   }
 
   const statusOptions = useMemo(() => {
@@ -470,19 +1341,13 @@ export default function Page() {
     return ["全部", ...Array.from(s).sort()];
   }, [rows]);
 
-  const costGroups = useMemo(() => {
-    const s = new Set<string>(Object.keys(COST_DEFAULTS));
-    groupOptions.forEach((g) => g !== "全部" && s.add(g));
-    return Array.from(s).sort();
-  }, [groupOptions]);
-
   /** 基础筛选（不含日期） */
   const baseRows = useMemo(() => {
-    const qq = q.trim().toLowerCase();
+    const qq = filters.q.trim().toLowerCase();
     return rows.filter((r) => {
-      if (status !== "全部" && (r.payoutStatus || "未知") !== status) return false;
-      if (category !== "全部" && (r.category || "") !== category) return false;
-      if (group !== "全部" && (r.titleGroup || "Other") !== group) return false;
+      if (filters.status !== "全部" && (r.payoutStatus || "未知") !== filters.status) return false;
+      if (filters.category !== "全部" && (r.category || "") !== filters.category) return false;
+      if (filters.group !== "全部" && (r.titleGroup || "Other") !== filters.group) return false;
 
       if (qq) {
         const sku = (r.sku || "").toLowerCase();
@@ -491,36 +1356,33 @@ export default function Page() {
       }
       return true;
     });
-  }, [rows, status, category, group, q]);
+  }, [rows, filters.status, filters.category, filters.group, filters.q]);
 
-  /** 两套口径 */
-  const paidRows = useMemo(
-    () => filterByDate(baseRows, (r) => r.paidAt, paidStartYmd, paidEndYmd),
-    [baseRows, paidStartYmd, paidEndYmd]
-  );
-  const payoutRows = useMemo(
-    () => filterByDate(baseRows, (r) => r.payoutAt, payoutStartYmd, payoutEndYmd),
-    [baseRows, payoutStartYmd, payoutEndYmd]
-  );
+  /** GMV：按付款时间的筛选（只影响 GMV 口径） */
+  const paidRows = useMemo(() => {
+    return filterByDate(baseRows, (r) => r.paidAt, filters.paidStartYmd, filters.paidEndYmd);
+  }, [baseRows, filters.paidStartYmd, filters.paidEndYmd]);
+
+  /** 回款/利润：按回款时间筛选（只影响回款与利润口径） */
+  const payoutRows = useMemo(() => {
+    return filterByDate(baseRows, (r) => r.payoutAt, filters.payoutStartYmd, filters.payoutEndYmd);
+  }, [baseRows, filters.payoutStartYmd, filters.payoutEndYmd]);
 
   /** 明细列表：同时应用两套日期范围（用户填了就生效） */
   const listRows = useMemo(() => {
     let out = baseRows;
-    out = filterByDate(out, (r) => r.paidAt, paidStartYmd, paidEndYmd);
-    out = filterByDate(out, (r) => r.payoutAt, payoutStartYmd, payoutEndYmd);
+    out = filterByDate(out, (r) => r.paidAt, filters.paidStartYmd, filters.paidEndYmd);
+    out = filterByDate(out, (r) => r.payoutAt, filters.payoutStartYmd, filters.payoutEndYmd);
     return out;
-  }, [baseRows, paidStartYmd, paidEndYmd, payoutStartYmd, payoutEndYmd]);
+  }, [baseRows, filters.paidStartYmd, filters.paidEndYmd, filters.payoutStartYmd, filters.payoutEndYmd]);
 
   /** KPI */
   const kpi = useMemo(() => {
     const gmvUsd = paidRows.reduce((s, r) => s + (r.gmvUsd || 0), 0);
     const payoutCny = payoutRows.reduce((s, r) => s + (r.payoutCny || 0), 0);
 
-    const totalCost = payoutRows.reduce(
-      (s, r) => s + (r.payoutCny ? totalCostOf(r) : 0),
-      0
-    );
-    const totalProfit = payoutRows.reduce((s, r) => s + profitOf(r), 0);
+    const totalCost = payoutRows.reduce((s, r) => s + (r.payoutCny ? calculators.totalCostOf(r) : 0), 0);
+    const totalProfit = payoutRows.reduce((s, r) => s + calculators.profitOf(r), 0);
     const margin = payoutCny > 0 ? totalProfit / payoutCny : 0;
 
     return {
@@ -532,23 +1394,9 @@ export default function Page() {
       totalProfit,
       margin,
     };
-  }, [baseRows, listRows, paidRows, payoutRows, costMap, rowCostOverride]);
+  }, [baseRows.length, listRows.length, paidRows, payoutRows, calculators]);
 
-  /** 趋势 */
-  const gmvSeries = useMemo(
-    () => buildDailySeries(paidRows, (r) => r.paidAt, (r) => r.gmvUsd, paidStartYmd, paidEndYmd),
-    [paidRows, paidStartYmd, paidEndYmd]
-  );
-  const payoutSeries = useMemo(
-    () => buildDailySeries(payoutRows, (r) => r.payoutAt, (r) => r.payoutCny, payoutStartYmd, payoutEndYmd),
-    [payoutRows, payoutStartYmd, payoutEndYmd]
-  );
-  const profitSeries = useMemo(
-    () => buildDailySeries(payoutRows, (r) => r.payoutAt, (r) => profitOf(r), payoutStartYmd, payoutEndYmd),
-    [payoutRows, payoutStartYmd, payoutEndYmd, costMap, rowCostOverride]
-  );
-
-  /** Top10：GMV/回款/利润 */
+  /** Top10 */
   const top10 = useMemo(() => {
     const agg = (input: Row[], getVal: (r: Row) => number) => {
       const m = new Map<string, number>();
@@ -565,59 +1413,69 @@ export default function Page() {
     return {
       gmv: agg(paidRows, (r) => r.gmvUsd),
       payout: agg(payoutRows, (r) => r.payoutCny),
-      profit: agg(payoutRows, (r) => profitOf(r)),
+      profit: agg(payoutRows, (r) => calculators.profitOf(r)),
     };
-  }, [paidRows, payoutRows, costMap, rowCostOverride]);
+  }, [paidRows, payoutRows, calculators]);
 
   /** Other 清单 */
   const otherRows = useMemo(() => {
     return baseRows.filter((r) => (r.titleGroup || "Other") === "Other").slice(0, 200);
   }, [baseRows]);
 
-  /** ✅ 自动分析报告（核心） */
-  const report = useMemo(() => {
+  /** 趋势 */
+  const gmvSeries = useMemo(() => buildDailySeries(paidRows, (r) => r.paidAt, (r) => r.gmvUsd, filters.paidStartYmd, filters.paidEndYmd), [
+    paidRows,
+    filters.paidStartYmd,
+    filters.paidEndYmd,
+  ]);
+  const payoutSeries = useMemo(() => buildDailySeries(payoutRows, (r) => r.payoutAt, (r) => r.payoutCny, filters.payoutStartYmd, filters.payoutEndYmd), [
+    payoutRows,
+    filters.payoutStartYmd,
+    filters.payoutEndYmd,
+  ]);
+  const profitSeries = useMemo(() => buildDailySeries(payoutRows, (r) => r.payoutAt, (r) => calculators.profitOf(r), filters.payoutStartYmd, filters.payoutEndYmd), [
+    payoutRows,
+    filters.payoutStartYmd,
+    filters.payoutEndYmd,
+    calculators,
+  ]);
+
+  /** 报告 */
+  const report = useMemo<ReportPayload>(() => {
     const topProfit = top10.profit[0];
     const topPayout = top10.payout[0];
     const topGmv = top10.gmv[0];
 
-    const otherCount = baseRows.filter((r) => r.titleGroup === "Other").length;
-    const otherRate = baseRows.length ? otherCount / baseRows.length : 0;
+    const payoutVals = payoutRows.map((r) => r.payoutCny || 0).filter((x) => x > 0);
+    const profitVals = payoutRows.map((r) => calculators.profitOf(r)).filter((x) => x !== 0);
 
-    const negProfitRows = payoutRows.filter((r) => r.payoutCny && profitOf(r) < 0);
-    const negCount = negProfitRows.length;
+    const medPayout = median(payoutVals);
+    const p10Payout = percentile(payoutVals, 0.1);
+    const p90Payout = percentile(payoutVals, 0.9);
 
-    // 回款延迟：回款时间 - 付款时间（天）
-    const lagDays = payoutRows
-      .map((r) => {
-        if (!r.paidAt || !r.payoutAt) return null;
-        const d = (r.payoutAt.getTime() - r.paidAt.getTime()) / 86400000;
-        return Number.isFinite(d) ? d : null;
-      })
-      .filter((x): x is number => x !== null);
+    const medProfit = median(profitVals);
+    const p10Profit = percentile(profitVals, 0.1);
+    const p90Profit = percentile(profitVals, 0.9);
 
-    const lagAvg = lagDays.length ? lagDays.reduce((a, b) => a + b, 0) / lagDays.length : 0;
-    const lagMed = median(lagDays);
-    const lagP90 = percentile(lagDays, 0.9);
-
-    // 回款状态分布（筛选后的 baseRows）
-    const statusMap = new Map<string, number>();
+    // 回款状态 Top3
+    const statusCount = new Map<string, number>();
     baseRows.forEach((r) => {
       const s = (r.payoutStatus || "未知").trim() || "未知";
-      statusMap.set(s, (statusMap.get(s) ?? 0) + 1);
+      statusCount.set(s, (statusCount.get(s) ?? 0) + 1);
     });
-    const statusTop = Array.from(statusMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    const statusTop = Array.from(statusCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3);
 
-    // 单条成本覆盖影响（只对 payoutRows 统计：有回款才有利润）
+    // 单条覆盖统计
     const overrideKeys = Object.keys(rowCostOverride);
     const overrideCountAll = overrideKeys.length;
 
     let overrideCountInView = 0;
-    let profitDeltaSum = 0; // (使用覆盖后的利润) - (默认利润)
+    let profitDeltaSum = 0;
     payoutRows.forEach((r) => {
       const id = rowId(r);
       if (Number.isFinite(rowCostOverride[id])) {
         overrideCountInView += 1;
-        profitDeltaSum += profitOf(r) - profitOfDefault(r);
+        profitDeltaSum += calculators.profitOf(r) - calculators.profitOfDefault(r);
       }
     });
 
@@ -630,607 +1488,167 @@ export default function Page() {
     if (topPayout) highlights.push(`回款Top1：${topPayout.group}（¥${money(topPayout.value)}）`);
     if (topGmv) highlights.push(`GMV Top1：${topGmv.group}（$${money(topGmv.value)}）`);
 
+    if (payoutVals.length >= 10) highlights.push(`回款分布：P10=¥${money(p10Payout)} / 中位=¥${money(medPayout)} / P90=¥${money(p90Payout)}`);
+    if (profitVals.length >= 10) highlights.push(`利润分布：P10=¥${money(p10Profit)} / 中位=¥${money(medProfit)} / P90=¥${money(p90Profit)}`);
+
     const risks: string[] = [];
-    risks.push(`未识别 Other：${otherCount} 条（${(otherRate * 100).toFixed(1)}%）`);
-    risks.push(`亏损单：${negCount} 条（回款<成本）`);
-    if (lagDays.length) {
-      risks.push(
-        `回款延迟(天)：平均 ${lagAvg.toFixed(1)}；中位数 ${lagMed.toFixed(1)}；P90 ${lagP90.toFixed(1)}（样本 ${lagDays.length}）`
-      );
-    } else {
-      risks.push("回款延迟：没有同时具备付款时间+回款时间的数据，无法统计");
-    }
+    if (kpi.payoutCny > 0 && kpi.margin < 0.1) risks.push("整体利润率偏低（<10%），注意成本或低价出货风险。");
+    if (kpi.totalProfit < 0) risks.push("当前筛选利润为负，请优先排查异常成本/低价订单。");
+    if (otherRows.length > 0) risks.push(`存在未命中分类规则的“Other”订单（${otherRows.length} 行展示），建议补充分类规则。`);
+    if (overrideCountInView > 0) risks.push(`本筛选视图内有 ${overrideCountInView} 条单条成本覆盖，利润合计变化 ¥${money(profitDeltaSum)}。`);
 
     const actions: string[] = [];
-    if (otherRate >= 0.05) actions.push("Other 占比偏高：建议把 Other 清单里的关键词补进分类规则（提升可分析性）");
-    if (negCount > 0) actions.push("存在亏损单：建议在订单明细里逐条校正成本（或检查标题分类是否误判）");
-    if (lagDays.length && lagP90 >= 10) actions.push("回款延迟较长：建议按“回款状态”筛选，优先跟进未回款/异常状态");
-    if (overrideCountInView > 0) {
-      actions.push(
-        `已对 ${overrideCountInView} 条回款单做了单条成本覆盖，利润影响合计 ${profitDeltaSum >= 0 ? "+" : ""}${money(profitDeltaSum, 2)} ¥`
-      );
-    } else {
-      actions.push("如遇特殊成本：可在订单明细里用“单条成本¥/lot”覆盖，不影响分类默认成本");
-    }
+    if (topProfit) actions.push(`加大高利润组：优先复盘【${topProfit.group}】的供货与定价策略。`);
+    if (kpi.payoutCny > 0 && kpi.margin < 0.15) actions.push("尝试：提高高毛利品占比 / 复查成本默认值 / 对低毛利组做限价。");
+    if (otherRows.length > 0) actions.push("把 Other 清单中高频关键词沉淀为规则（建议用“规则数组+优先级”维护）。");
+    if (overrideCountAll === 0) actions.push("如遇特殊成本：可在订单明细里用“单条成本¥/lot”覆盖，不影响分类默认成本");
+    else actions.push("单条成本覆盖：建议定期清理（清空后重新按分类默认成本口径回算）。");
 
-    const statusLine = statusTop.length
-      ? `回款状态Top3：${statusTop.map(([s, c]) => `${s}(${c})`).join("、")}`
-      : "回款状态Top3：无";
+    const statusLine = statusTop.length ? `回款状态Top3：${statusTop.map(([s, c]) => `${s}(${c})`).join("、")}` : "回款状态Top3：无";
 
-    const note =
-      "口径说明：GMV 按【付款时间】筛选聚合；回款/利润按【回款时间】筛选聚合（两套时间范围互不影响）。";
+    const note = "口径说明：GMV 按【付款时间】筛选聚合；回款/利润按【回款时间】筛选聚合（两套时间范围互不影响）。";
 
     const copyText =
       `【自动分析报告】\n` +
       `${summary}\n` +
       `${statusLine}\n` +
-      `\n亮点：\n- ${highlights.join("\n- ") || "暂无"}\n` +
-      `\n风险：\n- ${risks.join("\n- ")}\n` +
-      `\n建议：\n- ${actions.join("\n- ")}\n` +
-      `\n${note}\n` +
+      `\n` +
+      `【亮点】\n- ${highlights.length ? highlights.join("\n- ") : "暂无"}\n\n` +
+      `【风险】\n- ${risks.length ? risks.join("\n- ") : "暂无"}\n\n` +
+      `【建议动作】\n- ${actions.length ? actions.join("\n- ") : "暂无"}\n\n` +
+      `${note}\n` +
+      `\n` +
       `单条成本覆盖：全局共 ${overrideCountAll} 条（本筛选视图内影响已统计）。`;
 
-    return {
-      summary,
-      highlights,
-      risks,
-      actions,
-      statusLine,
-      note,
-      copyText,
-    };
-  }, [top10, baseRows, payoutRows, kpi, rowCostOverride, costMap]);
+    return { summary, highlights, risks, actions, statusLine, note, copyText };
+  }, [top10, baseRows, payoutRows, kpi, rowCostOverride, costMap, calculators, otherRows.length]);
 
-  /** 明细：排序 + 分页 */
-  const [sortKey, setSortKey] = useState<"profit" | "payout" | "gmv" | "lot">("profit");
-  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
-  const [page, setPage] = useState(1);
-  const pageSize = 50;
-
-  useEffect(() => setPage(1), [status, category, group, q, paidStartYmd, paidEndYmd, payoutStartYmd, payoutEndYmd]);
-
+  /** 明细：排序 + 分页（全局 reducer 状态驱动） */
   const sortedListRows = useMemo(() => {
     const arr = [...listRows];
-    const val = (r: Row) => {
-      if (sortKey === "profit") return profitOf(r);
-      if (sortKey === "payout") return r.payoutCny || 0;
-      if (sortKey === "gmv") return r.gmvUsd || 0;
-      return lotCountOf(r);
-    };
-    arr.sort((a, b) => (val(a) - val(b)) * (sortDir === "asc" ? 1 : -1));
-    return arr;
-  }, [listRows, sortKey, sortDir, costMap, rowCostOverride]);
 
-  const totalPages = Math.max(1, Math.ceil(sortedListRows.length / pageSize));
-  const pagedRows = useMemo(
-    () => sortedListRows.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize),
-    [sortedListRows, page]
-  );
+    const val = (r: Row) => {
+      if (filters.sortKey === "profit") return calculators.profitOf(r);
+      if (filters.sortKey === "payout") return r.payoutCny || 0;
+      if (filters.sortKey === "gmv") return r.gmvUsd || 0;
+      return calculators.lotCountOf(r);
+    };
+
+    arr.sort((a, b) => (val(a) - val(b)) * (filters.sortDir === "asc" ? 1 : -1));
+    return arr;
+  }, [listRows, filters.sortKey, filters.sortDir, calculators]);
+
+  const pagedRows = useMemo(() => {
+    const start = (filters.page - 1) * filters.pageSize;
+    return sortedListRows.slice(start, start + filters.pageSize);
+  }, [sortedListRows, filters.page, filters.pageSize]);
+
+  const exportDisabled = listRows.length === 0;
+
+  const onReset = () => {
+    dispatch({ type: "reset" });
+    push("info", "已清空筛选条件");
+  };
 
   const onCopyReport = async () => {
     try {
       await navigator.clipboard.writeText(report.copyText);
-      alert("已复制分析报告 ✅");
+      push("success", "已复制报告到剪贴板");
     } catch {
-      alert("复制失败：你的浏览器可能禁止剪贴板权限");
+      push("error", "复制失败：浏览器可能不允许访问剪贴板");
     }
   };
 
   return (
-    <div style={{ background: "#f8fafc", minHeight: "100vh" }}>
-      {/* 顶栏 */}
-      <div style={{ position: "sticky", top: 0, zIndex: 10, background: "rgba(248,250,252,0.9)", backdropFilter: "blur(6px)", borderBottom: "1px solid #e2e8f0" }}>
-        <div style={{ maxWidth: 1260, margin: "0 auto", padding: "14px 16px" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 18, fontWeight: 900, color: "#0f172a" }}>eBay Excel Dashboard</div>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <button style={pill(tab === "overview")} onClick={() => setTab("overview")}>总览</button>
-              <button style={pill(tab === "orders")} onClick={() => setTab("orders")}>订单明细</button>
-              <button style={pill(tab === "costs")} onClick={() => setTab("costs")}>成本设置</button>
-            </div>
+    <div style={{ padding: 16, background: "#f8fafc", minHeight: "100vh" }}>
+      <ToastStack toasts={toasts} onClose={remove} />
 
-            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <input type="file" accept=".xlsx,.xls" onChange={onFile} />
-              <div style={smallStyle()}>{rows.length ? `已加载 ${rows.length.toLocaleString()} 行` : "先上传 Excel"}</div>
-            </div>
-          </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 18, fontWeight: 950, color: "#0f172a" }}>eBay Excel Dashboard</div>
+        <div style={{ ...smallStyle() }}>升级版（组件化 + Reducer + Toast + 导出）</div>
+        <div style={{ flex: 1 }} />
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setTab("overview")} style={pill(tab === "overview")}>
+            Overview
+          </button>
+          <button onClick={() => setTab("orders")} style={pill(tab === "orders")}>
+            Orders
+          </button>
+          <button onClick={() => setTab("costs")} style={pill(tab === "costs")}>
+            Costs
+          </button>
         </div>
       </div>
 
-      {/* 主体：左筛选 + 右内容 */}
-      <div style={{ maxWidth: 1260, margin: "0 auto", padding: 16 }}>
-        <div style={{ display: "grid", gridTemplateColumns: "340px 1fr", gap: 14, alignItems: "start" }}>
-          {/* 左：筛选 */}
-          <div style={{ ...card(), ...cardPad(), position: "sticky", top: 78 }}>
-            <div style={{ fontWeight: 900, color: "#0f172a" }}>筛选器</div>
-            <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-              <label>
-                <div style={smallStyle()}>付款时间范围（GMV）</div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 6 }}>
-                  <input type="date" value={paidStartYmd} onChange={(e) => setPaidStartYmd(e.target.value)} style={inputBase()} />
-                  <input type="date" value={paidEndYmd} onChange={(e) => setPaidEndYmd(e.target.value)} style={inputBase()} />
-                </div>
-              </label>
+      <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 12, alignItems: "start" }}>
+        <FilterPanel
+          isParsing={isParsing}
+          onFile={onFile}
+          filters={filters}
+          dispatch={dispatch}
+          statusOptions={statusOptions}
+          categoryOptions={categoryOptions}
+          groupOptions={groupOptions}
+          onReset={onReset}
+          onExportCSV={() => {
+            exportRowsToCSV(listRows, calculators.costPerLotForRow);
+            push("success", "已开始导出 CSV");
+          }}
+          onExportExcel={() => {
+            exportRowsToExcel(listRows, calculators.costPerLotForRow);
+            push("success", "已开始导出 Excel");
+          }}
+          exportDisabled={exportDisabled}
+        />
 
-              <label>
-                <div style={smallStyle()}>回款时间范围（回款/利润）</div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 6 }}>
-                  <input type="date" value={payoutStartYmd} onChange={(e) => setPayoutStartYmd(e.target.value)} style={inputBase()} />
-                  <input type="date" value={payoutEndYmd} onChange={(e) => setPayoutEndYmd(e.target.value)} style={inputBase()} />
-                </div>
-              </label>
+        <div style={{ display: "grid", gap: 12 }}>
+          <KpiGrid kpi={kpi} />
 
-              <label>
-                <div style={smallStyle()}>回款状态</div>
-                <select value={status} onChange={(e) => setStatus(e.target.value)} style={inputBase()}>
-                  {statusOptions.map((s) => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </label>
-
-              <label>
-                <div style={smallStyle()}>类目（卡片类目）</div>
-                <select value={category} onChange={(e) => setCategory(e.target.value)} style={inputBase()}>
-                  {categoryOptions.map((c) => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </label>
-
-              <label>
-                <div style={smallStyle()}>标题分类（titleGroup）</div>
-                <select value={group} onChange={(e) => setGroup(e.target.value)} style={inputBase()}>
-                  {groupOptions.map((g) => <option key={g} value={g}>{g}</option>)}
-                </select>
-              </label>
-
-              <label>
-                <div style={smallStyle()}>SKU / 标题搜索</div>
-                <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="输入关键字" style={inputBase()} />
-              </label>
-
-              <div style={{ display: "grid", gap: 6, marginTop: 4 }}>
-                <div style={smallStyle()}>筛选后行数：{kpi.baseCount.toLocaleString()}</div>
-                <div style={smallStyle()}>明细列表行数：{kpi.listCount.toLocaleString()}</div>
-              </div>
-
-              <button
-                onClick={() => {
-                  setPaidStartYmd(""); setPaidEndYmd("");
-                  setPayoutStartYmd(""); setPayoutEndYmd("");
-                  setStatus("全部"); setCategory("全部"); setGroup("全部"); setQ("");
-                }}
-                style={{ padding: "10px 12px", borderRadius: 12, border: "1px solid #e2e8f0", background: "#fff", cursor: "pointer", fontWeight: 900 }}
-              >
-                清空筛选
-              </button>
+          {tab === "overview" && (
+            <div style={{ display: "grid", gap: 12 }}>
+              <ReportCard report={report} onCopy={onCopyReport} isDisabled={!rows.length} />
+              <OverviewCharts
+                overviewView={overviewView}
+                setOverviewView={setOverviewView}
+                top10={top10}
+                gmvSeries={gmvSeries}
+                payoutSeries={payoutSeries}
+                profitSeries={profitSeries}
+                otherRows={otherRows}
+              />
             </div>
-          </div>
+          )}
 
-          {/* 右：内容 */}
-          <div style={{ display: "grid", gap: 14 }}>
-            {/* 总览 */}
-            {tab === "overview" && (
-              <>
-                {/* KPI */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 12 }}>
-                  <div style={{ ...card(), ...cardPad() }}>
-                    <div style={smallStyle()}>GMV($)（付款口径）</div>
-                    <div style={{ fontSize: 22, fontWeight: 900 }}>{money(kpi.gmvUsd)}</div>
-                  </div>
-                  <div style={{ ...card(), ...cardPad() }}>
-                    <div style={smallStyle()}>回款(¥)（回款口径）</div>
-                    <div style={{ fontSize: 22, fontWeight: 900 }}>{money(kpi.payoutCny)}</div>
-                  </div>
-                  <div style={{ ...card(), ...cardPad() }}>
-                    <div style={smallStyle()}>成本合计(¥)（回款口径）</div>
-                    <div style={{ fontSize: 22, fontWeight: 900 }}>{money(kpi.totalCost)}</div>
-                  </div>
-                  <div style={{ ...card(), ...cardPad() }}>
-                    <div style={smallStyle()}>利润合计(¥)（回款-成本）</div>
-                    <div style={{ fontSize: 22, fontWeight: 900 }}>{money(kpi.totalProfit)}</div>
-                    <div style={smallStyle()}>{`利润率 ${(kpi.margin * 100).toFixed(1)}%`}</div>
-                  </div>
-                </div>
+          {tab === "orders" && (
+            <OrdersTable
+              rows={rows}
+              filters={filters}
+              dispatch={dispatch}
+              totalRows={sortedListRows.length}
+              pagedRows={pagedRows}
+              costPerLotForRow={calculators.costPerLotForRow}
+              totalCostOf={calculators.totalCostOf}
+              profitOf={calculators.profitOf}
+              rowCostOverride={rowCostOverride}
+              setRowCostOverride={setRowCostOverride}
+            />
+          )}
 
-                {/* ✅ 自动分析报告 */}
-                <div style={{ ...card(), ...cardPad() }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                    <div style={{ fontWeight: 900 }}>自动分析报告</div>
-                    <div style={smallStyle()}>{report.note}</div>
-                    <button
-                      onClick={onCopyReport}
-                      style={{ marginLeft: "auto", padding: "8px 10px", borderRadius: 10, border: "1px solid #e2e8f0", background: "#fff", cursor: "pointer", fontWeight: 900 }}
-                    >
-                      复制报告
-                    </button>
-                  </div>
-
-                  <div style={{ marginTop: 10, fontWeight: 900 }}>{report.summary}</div>
-                  <div style={{ marginTop: 6, ...smallStyle() }}>{report.statusLine}</div>
-
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 12, marginTop: 12 }}>
-                    <div style={{ ...card(), padding: 12, background: "#fff" }}>
-                      <div style={{ fontWeight: 900 }}>亮点</div>
-                      <ul style={{ margin: "8px 0 0 18px", ...smallStyle() }}>
-                        {(report.highlights.length ? report.highlights : ["暂无"]).map((x, i) => <li key={i}>{x}</li>)}
-                      </ul>
-                    </div>
-                    <div style={{ ...card(), padding: 12, background: "#fff" }}>
-                      <div style={{ fontWeight: 900 }}>风险</div>
-                      <ul style={{ margin: "8px 0 0 18px", ...smallStyle() }}>
-                        {report.risks.map((x, i) => <li key={i}>{x}</li>)}
-                      </ul>
-                    </div>
-                    <div style={{ ...card(), padding: 12, background: "#fff" }}>
-                      <div style={{ fontWeight: 900 }}>建议动作</div>
-                      <ul style={{ margin: "8px 0 0 18px", ...smallStyle() }}>
-                        {report.actions.map((x, i) => <li key={i}>{x}</li>)}
-                      </ul>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 图表二级选项：一次只显示一个 */}
-                <div style={{ ...card(), ...cardPad() }}>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <button style={pill(overviewView === "top10-gmv")} onClick={() => setOverviewView("top10-gmv")}>Top10 GMV</button>
-                    <button style={pill(overviewView === "top10-payout")} onClick={() => setOverviewView("top10-payout")}>Top10 回款</button>
-                    <button style={pill(overviewView === "top10-profit")} onClick={() => setOverviewView("top10-profit")}>Top10 利润</button>
-                    <button style={pill(overviewView === "trend-gmv")} onClick={() => setOverviewView("trend-gmv")}>趋势 GMV</button>
-                    <button style={pill(overviewView === "trend-payout")} onClick={() => setOverviewView("trend-payout")}>趋势 回款</button>
-                    <button style={pill(overviewView === "trend-profit")} onClick={() => setOverviewView("trend-profit")}>趋势 利润</button>
-                    <button style={pill(overviewView === "other")} onClick={() => setOverviewView("other")}>Other 清单</button>
-                  </div>
-
-                  <div style={{ marginTop: 12, width: "100%", height: 420 }}>
-                    {overviewView === "top10-gmv" && (
-                      <>
-                        <div style={{ fontWeight: 900, marginBottom: 8 }}>分类 Top10（GMV $）</div>
-                        <ResponsiveContainer>
-                          <BarChart data={top10.gmv} layout="vertical" margin={{ left: 20, right: 20 }}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis type="number" />
-                            <YAxis type="category" dataKey="group" width={170} />
-                            <Tooltip />
-                            <Bar dataKey="value" name="GMV($)" />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </>
-                    )}
-
-                    {overviewView === "top10-payout" && (
-                      <>
-                        <div style={{ fontWeight: 900, marginBottom: 8 }}>分类 Top10（回款 ¥）</div>
-                        <ResponsiveContainer>
-                          <BarChart data={top10.payout} layout="vertical" margin={{ left: 20, right: 20 }}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis type="number" />
-                            <YAxis type="category" dataKey="group" width={170} />
-                            <Tooltip />
-                            <Bar dataKey="value" name="回款(¥)" />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </>
-                    )}
-
-                    {overviewView === "top10-profit" && (
-                      <>
-                        <div style={{ fontWeight: 900, marginBottom: 8 }}>分类 Top10（利润 ¥）</div>
-                        <ResponsiveContainer>
-                          <BarChart data={top10.profit} layout="vertical" margin={{ left: 20, right: 20 }}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis type="number" />
-                            <YAxis type="category" dataKey="group" width={170} />
-                            <Tooltip />
-                            <Bar dataKey="value" name="利润(¥)" />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </>
-                    )}
-
-                    {overviewView === "trend-gmv" && (
-                      <>
-                        <div style={{ fontWeight: 900, marginBottom: 8 }}>GMV 按天趋势（付款时间）</div>
-                        <ResponsiveContainer>
-                          <LineChart data={gmvSeries} margin={{ left: 10, right: 20, bottom: 30 }}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis dataKey="date" angle={-30} textAnchor="end" height={60} interval="preserveStartEnd" />
-                            <YAxis />
-                            <Tooltip />
-                            <Line type="monotone" dataKey="value" name="GMV($)" stroke="#111827" dot={false} />
-                          </LineChart>
-                        </ResponsiveContainer>
-                      </>
-                    )}
-
-                    {overviewView === "trend-payout" && (
-                      <>
-                        <div style={{ fontWeight: 900, marginBottom: 8 }}>回款 按天趋势（回款时间）</div>
-                        <ResponsiveContainer>
-                          <LineChart data={payoutSeries} margin={{ left: 10, right: 20, bottom: 30 }}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis dataKey="date" angle={-30} textAnchor="end" height={60} interval="preserveStartEnd" />
-                            <YAxis />
-                            <Tooltip />
-                            <Line type="monotone" dataKey="value" name="回款(¥)" stroke="#0f766e" dot={false} />
-                          </LineChart>
-                        </ResponsiveContainer>
-                      </>
-                    )}
-
-                    {overviewView === "trend-profit" && (
-                      <>
-                        <div style={{ fontWeight: 900, marginBottom: 8 }}>利润 按天趋势（回款时间）</div>
-                        <ResponsiveContainer>
-                          <LineChart data={profitSeries} margin={{ left: 10, right: 20, bottom: 30 }}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis dataKey="date" angle={-30} textAnchor="end" height={60} interval="preserveStartEnd" />
-                            <YAxis />
-                            <Tooltip />
-                            <Line type="monotone" dataKey="value" name="利润(¥)" stroke="#7c3aed" dot={false} />
-                          </LineChart>
-                        </ResponsiveContainer>
-                      </>
-                    )}
-
-                    {overviewView === "other" && (
-                      <div style={{ height: "100%", display: "grid", gridTemplateRows: "auto 1fr" }}>
-                        <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-                          <div style={{ fontWeight: 900 }}>未识别（Other）清单</div>
-                          <div style={smallStyle()}>{`最多显示 200，当前 ${otherRows.length}`}</div>
-                          <button
-                            onClick={() => setTab("orders")}
-                            style={{ marginLeft: "auto", padding: "8px 10px", borderRadius: 10, border: "1px solid #e2e8f0", background: "#fff", cursor: "pointer", fontWeight: 900 }}
-                          >
-                            去订单明细看全部 →
-                          </button>
-                        </div>
-
-                        <div style={{ marginTop: 10, overflow: "auto", border: "1px solid #e2e8f0", borderRadius: 12 }}>
-                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                            <thead>
-                              <tr style={{ background: "#f1f5f9" }}>
-                                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e2e8f0" }}>SKU</th>
-                                <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e2e8f0" }}>标题</th>
-                                <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #e2e8f0" }}>Lot</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {otherRows.map((r, idx) => (
-                                <tr key={idx}>
-                                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.sku}</td>
-                                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9" }}>{r.name}</td>
-                                  <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>{lotCountOf(r)}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  <div style={{ marginTop: 8, ...smallStyle() }}>
-                    说明：Top10 左侧文字截断已修复（YAxis 加宽），趋势日期也倾斜避免重叠。
-                  </div>
-                </div>
-              </>
-            )}
-
-            {/* 订单明细（单条成本覆盖） */}
-            {tab === "orders" && (
-              <div style={{ ...card(), ...cardPad() }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                  <div style={{ fontWeight: 900 }}>订单明细（筛选后全部商品）</div>
-                  <div style={smallStyle()}>{`共 ${sortedListRows.length.toLocaleString()} 条，每页 ${pageSize}`}</div>
-
-                  <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                    <select value={sortKey} onChange={(e) => setSortKey(e.target.value as any)} style={{ ...inputBase(), width: 140 }}>
-                      <option value="profit">按利润</option>
-                      <option value="payout">按回款</option>
-                      <option value="gmv">按GMV</option>
-                      <option value="lot">按Lot数量</option>
-                    </select>
-                    <select value={sortDir} onChange={(e) => setSortDir(e.target.value as any)} style={{ ...inputBase(), width: 120 }}>
-                      <option value="desc">从高到低</option>
-                      <option value="asc">从低到高</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div style={{ marginTop: 10, border: "1px solid #e2e8f0", borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ overflow: "auto" }}>
-                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 1180 }}>
-                      <thead>
-                        <tr style={{ background: "#f1f5f9" }}>
-                          <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e2e8f0" }}>titleGroup</th>
-                          <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e2e8f0" }}>SKU</th>
-                          <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e2e8f0" }}>标题</th>
-                          <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #e2e8f0" }}>Lot</th>
-
-                          <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #e2e8f0" }}>单条成本¥/lot（可改）</th>
-                          <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #e2e8f0" }}>默认成本¥/lot</th>
-
-                          <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #e2e8f0" }}>总成本¥</th>
-                          <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #e2e8f0" }}>回款¥</th>
-                          <th style={{ textAlign: "right", padding: 10, borderBottom: "1px solid #e2e8f0" }}>利润¥</th>
-                          <th style={{ textAlign: "left", padding: 10, borderBottom: "1px solid #e2e8f0" }}>回款状态</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {pagedRows.map((r, idx) => {
-                          const id = rowId(r);
-                          const lot = lotCountOf(r);
-
-                          const defaultC = costPerLotOfGroup(r.titleGroup);
-                          const overrideVal = rowCostOverride[id];
-                          const hasOverride = Number.isFinite(overrideVal);
-
-                          const cTotal = totalCostOf(r);
-                          const p = profitOf(r);
-
-                          return (
-                            <tr key={idx}>
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.titleGroup}</td>
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>{r.sku}</td>
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9" }}>{r.name}</td>
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>{lot}</td>
-
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>
-                                <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
-                                  <input
-                                    type="number"
-                                    step="0.1"
-                                    value={hasOverride ? String(overrideVal) : ""}
-                                    placeholder={String(defaultC)}
-                                    onChange={(e) => {
-                                      const vStr = e.target.value;
-                                      if (!vStr) {
-                                        setRowCostOverride((prev) => {
-                                          const next = { ...prev };
-                                          delete next[id];
-                                          return next;
-                                        });
-                                        return;
-                                      }
-                                      const v = Number(vStr);
-                                      if (!Number.isFinite(v)) return;
-                                      setRowCostOverride((prev) => ({ ...prev, [id]: v }));
-                                    }}
-                                    style={{
-                                      width: 110,
-                                      padding: "6px 8px",
-                                      borderRadius: 10,
-                                      border: "1px solid #e2e8f0",
-                                      fontWeight: 800,
-                                      background: hasOverride ? "#fff7ed" : "#fff",
-                                    }}
-                                    title="留空=用默认成本"
-                                  />
-                                  {hasOverride && (
-                                    <button
-                                      onClick={() => {
-                                        setRowCostOverride((prev) => {
-                                          const next = { ...prev };
-                                          delete next[id];
-                                          return next;
-                                        });
-                                      }}
-                                      style={{
-                                        padding: "6px 8px",
-                                        borderRadius: 10,
-                                        border: "1px solid #e2e8f0",
-                                        background: "#fff",
-                                        cursor: "pointer",
-                                        fontWeight: 900,
-                                        fontSize: 12,
-                                      }}
-                                      title="恢复默认成本"
-                                    >
-                                      恢复
-                                    </button>
-                                  )}
-                                </div>
-                                <div style={{ marginTop: 4, ...smallStyle(), textAlign: "right" }}>
-                                  {hasOverride ? "已覆盖" : "使用默认"}
-                                </div>
-                              </td>
-
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>
-                                {money(defaultC, 2)}
-                              </td>
-
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>
-                                {money(cTotal, 2)}
-                              </td>
-
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right" }}>
-                                {money(r.payoutCny)}
-                              </td>
-
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9", textAlign: "right", fontWeight: 900 }}>
-                                {r.payoutCny ? money(p) : "-"}
-                              </td>
-
-                              <td style={{ padding: 10, borderBottom: "1px solid #f1f5f9" }}>{r.payoutStatus}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: 10, borderTop: "1px solid #e2e8f0", background: "#fff" }}>
-                    <button
-                      onClick={() => setPage((p) => Math.max(1, p - 1))}
-                      style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #e2e8f0", background: "#fff", cursor: "pointer", fontWeight: 900 }}
-                    >
-                      上一页
-                    </button>
-                    <div style={smallStyle()}>{`第 ${page} / ${totalPages} 页`}</div>
-                    <button
-                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                      style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #e2e8f0", background: "#fff", cursor: "pointer", fontWeight: 900 }}
-                    >
-                      下一页
-                    </button>
-                  </div>
-                </div>
-
-                <div style={{ marginTop: 10, ...smallStyle() }}>
-                  提示：单条成本输入框留空=恢复默认分类成本；修改后自动保存，刷新不丢。
-                </div>
-              </div>
-            )}
-
-            {/* 成本设置 */}
-            {tab === "costs" && (
-              <div style={{ ...card(), ...cardPad() }}>
-                <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-                  <div style={{ fontWeight: 900 }}>成本设置（每 1 lot 成本，¥）</div>
-                  <div style={smallStyle()}>修改会自动保存（分类默认成本）。</div>
-                  <button
-                    onClick={() => setCostMap({ ...COST_DEFAULTS })}
-                    style={{ marginLeft: "auto", padding: "8px 10px", borderRadius: 10, border: "1px solid #e2e8f0", background: "#fff", cursor: "pointer", fontWeight: 900 }}
-                  >
-                    恢复默认
-                  </button>
-                </div>
-
-                <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
-                  {costGroups.map((g) => (
-                    <div key={g} style={{ ...card(), padding: 12 }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-                        <div style={{ fontWeight: 900 }}>{g}</div>
-                        <div style={smallStyle()}>{`当前：${money(costMap[g] ?? 0, 2)} ¥/lot`}</div>
-                      </div>
-
-                      <div style={{ marginTop: 10 }}>
-                        <input
-                          type="number"
-                          step="0.1"
-                          value={String(costMap[g] ?? 0)}
-                          onChange={(e) => {
-                            const v = Number(e.target.value);
-                            setCostMap((prev) => ({ ...prev, [g]: Number.isFinite(v) ? v : 0 }));
-                          }}
-                          style={{ width: "100%", padding: 10, borderRadius: 12, border: "1px solid #e2e8f0", fontWeight: 900 }}
-                        />
-                        <div style={{ marginTop: 8, ...smallStyle() }}>
-                          {`举例：100 Lot -> 成本 ${money((costMap[g] ?? 0) * 100, 2)} ¥`}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <div style={{ marginTop: 12, ...smallStyle() }}>
-                  说明：订单明细里可以对单条商品覆盖成本（¥/lot），那种覆盖不会影响这里的分类默认成本。
-                </div>
-              </div>
-            )}
-          </div>
+          {tab === "costs" && (
+            <CostsPanel
+              costMap={costMap}
+              setCostMap={setCostMap}
+              groupOptions={groupOptions}
+              rowCostOverride={rowCostOverride}
+              setRowCostOverride={setRowCostOverride}
+            />
+          )}
         </div>
+      </div>
+
+      <div style={{ marginTop: 12, ...smallStyle() }}>
+        小贴士：如果后续要上 TanStack Table / 虚拟滚动，把 OrdersTable 单独迁移即可；当前结构已为后续扩展预留边界。
       </div>
     </div>
   );
 }
-
