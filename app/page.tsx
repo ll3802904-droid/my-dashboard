@@ -118,72 +118,81 @@ function rowId(r: Row) {
   );
 }
 
-/** ========== 标题分类（规则数组 + 优先级顺序） ========== */
-type TitleRule = { name: string; test: (t: string) => boolean };
+/** ========== 标题分类 ========== */
 
 function classifyTitleGroup(title: string) {
   const t = (title || "").replace(/\s+/g, " ").trim();
 
-  // 特征提取（避免规则里重复写很多 regex）
-  const has = {
-    kfc: /\bkfc\b/i.test(t),
-    sealed: /\bsealed\b/i.test(t),
-    tagTeam: /\btag\s*team\b/i.test(t),
-    trainer: /\btrainer\b/i.test(t) || /\bsupporter\b/i.test(t) || /\bitem\b/i.test(t),
-    ocd: /\bocd\b/i.test(t),
-    masterBall: /\bmaster\s*ball\b/i.test(t),
-    logoReverse: /\blogo\b/i.test(t) && /\breverse\b/i.test(t),
-    ballHolo: /\bball\b/i.test(t) && /\bholo\b/i.test(t),
-    mix: /\bmix\b/i.test(t),
+  // 关键词类（优先级最高）
+  const hasKfcPack = /\bkfc\b/i.test(t) && /\bpack(s)?\b/i.test(t); // KFC + pack/packs
+  const hasOcd = /\bocd\b/i.test(t);
+  const hasTagTeam = /\btag\s*team\b/i.test(t);
+  const hasSealed = /\bsealed\b/i.test(t);
 
-    ar: /\bar\b/i.test(t),
-    chr: /\bchr\b/i.test(t),
-    sr: /\bsr\b/i.test(t),
-    hr: /\bhr\b/i.test(t),
+  const hasMasterBall = /\bmaster\s*ball\b/i.test(t);
+  const hasLogoReverseHolo = /\blogo\s*reverse\s*holo\b/i.test(t);
+  const hasBallHolo = /\bball\s*holo\b/i.test(t); // 注意：Master Ball Holo 也会匹配这里，但因为 Master Ball 在前面，所以不会被抢
+  const hasMix = /\bmix\b/i.test(t);
 
-    rrr: /\brrr\b/i.test(t),
-    rr: /\brr\b/i.test(t),
-    vmax: /\bvmax\b/i.test(t),
+  const hasAR = /\bAR\b/i.test(t);
+  const hasCHR = /\bCHR\b/i.test(t);
 
-    japanese: /\bjapanese\b/i.test(t),
+  const hasSR = /\bSR\b/i.test(t);
+  const hasHR = /\bHR\b/i.test(t);
 
-    otherRarity:
-      /\brrrr\b/i.test(t) ||
-      /\bur\b/i.test(t) ||
-      /\bssr\b/i.test(t) ||
-      /\bsar\b/i.test(t) ||
-      /\bcsr\b/i.test(t) ||
-      /\bace\b/i.test(t) ||
-      /\bex\b/i.test(t) ||
-      /\bgold\b/i.test(t) ||
-      /\bsecret\b/i.test(t),
-  };
+  // 稀有度/形态类（“只包含xx”的那几类）
+  const hasRRR = /\bRRR\b/i.test(t);
+  const hasRR = /\bRR\b/i.test(t); // 不会误伤 RRR（因为 RRR 中间没有词边界）
+  const hasVMAX = /\bVMAX\b/i.test(t);
 
-  const rules: TitleRule[] = [
-    { name: "KFC Pack", test: () => has.kfc },
-    { name: "Sealed", test: () => has.sealed },
-    { name: "TAG TEAM", test: () => has.tagTeam },
-    { name: "Trainer Item / Supporter", test: () => has.trainer },
-    { name: "OCD", test: () => has.ocd },
-    { name: "Master Ball", test: () => has.masterBall },
-    { name: "Logo Reverse Holo", test: () => has.logoReverse },
-    { name: "Ball Holo", test: () => has.ballHolo },
-    { name: "Mix", test: () => has.mix },
-    { name: "AR/CHR", test: () => has.ar || has.chr },
-    { name: "SR/HR", test: () => (has.sr || has.hr) && !has.ocd },
-    { name: "Japanese", test: () => has.japanese },
+  // 其他稀有度（出现就排除“只包含RR/只包含RR+RRR/只包含RRR+VMAX”）
+  const hasOtherRarity =
+    /\bRRRR\b/i.test(t) ||
+    /\bUR\b/i.test(t) ||
+    /\bSSR\b/i.test(t) ||
+    hasSR ||
+    hasHR ||
+    hasAR ||
+    hasCHR ||
+    hasTagTeam; // TAG TEAM 单独一类
 
-    // RR / RRR / VMAX：尽量排到最后（避免被“otherRarity”误伤）
-    { name: "RRR+VMAX", test: () => has.rrr && has.vmax && !has.rr && !has.otherRarity },
-    { name: "RR+RRR", test: () => has.rr && has.rrr && !has.otherRarity },
-    { name: "RR Only", test: () => has.rr && !has.rrr && !has.otherRarity },
-  ];
+  // 语言类（出现 Japanese 就直接归 Japanese）
+  const isJapanese = /\bjapanese\b/i.test(t);
 
-  for (const r of rules) if (r.test(t)) return r.name;
+  // ——优先级命中——
+  if (hasKfcPack) return "KFC Pack";
+  if (hasOcd) return "OCD";
+  if (hasTagTeam) return "TAG TEAM";
+  if (hasSealed) return "Sealed";
+  if (hasMasterBall) return "Master Ball"; // ✅ Master Ball 优先于 Ball Holo
+  if (hasLogoReverseHolo) return "Logo Reverse Holo";
+  if (hasBallHolo) return "Ball Holo";
+  if (hasMix) return "Mix";
+  if (hasAR || hasCHR) return "AR/CHR";
+  if ((hasSR || hasHR) && !hasOcd) return "SR/HR"; // ✅ SR/HR 不要有 OCD
+  if (isJapanese) return "Japanese";
+
+  // ——“只包含xx”类别（放在最后，避免抢走更具体的类）——
+
+  // 只包含 RRR + VMAX（不能带 RR、不能带 SR/AR/CHR/HR/TAG TEAM 等）
+  if (hasRRR && hasVMAX && !hasRR && !hasOtherRarity) return "RRR+VMAX Only";
+
+  // 只包含 RR + RRR（不能带 VMAX，也不能带其它稀有度）
+  if (hasRR && hasRRR && !hasVMAX && !hasOtherRarity) return "RR+RRR Only";
+
+  // 只包含 RR（不能带 RRR/VMAX，也不能带其它稀有度）
+  if (hasRR && !hasRRR && !hasVMAX && !hasOtherRarity) return "RR Only";
+
+  // 只包含 RRR（可选但常用）
+  if (hasRRR && !hasRR && !hasVMAX && !hasOtherRarity) return "RRR Only";
+
+  // 只包含 VMAX（可选但常用）
+  if (hasVMAX && !hasRR && !hasRRR && !hasOtherRarity) return "VMAX Only";
+
   return "Other";
 }
 
-/** ========== 从标题解析 Lot 数量（100 Lot / Lot 100 / 1.50 Lot -> 150 容错） ========== */
+
 function parseLotCountFromTitle(title: string): number {
   const t = (title || "").replace(/\s+/g, " ").trim();
 
@@ -1442,87 +1451,292 @@ export default function Page() {
 
   /** 报告 */
   const report = useMemo<ReportPayload>(() => {
-    const topProfit = top10.profit[0];
-    const topPayout = top10.payout[0];
-    const topGmv = top10.gmv[0];
+      const paidRange =
+        filters.paidStartYmd || filters.paidEndYmd
+          ? `${filters.paidStartYmd || "最早"} ~ ${filters.paidEndYmd || "最新"}`
+          : "全量";
+      const payoutRange =
+        filters.payoutStartYmd || filters.payoutEndYmd
+          ? `${filters.payoutStartYmd || "最早"} ~ ${filters.payoutEndYmd || "最新"}`
+          : "全量";
 
-    const payoutVals = payoutRows.map((r) => r.payoutCny || 0).filter((x) => x > 0);
-    const profitVals = payoutRows.map((r) => calculators.profitOf(r)).filter((x) => x !== 0);
+      const baseCount = baseRows.length;
+      const paidCount = paidRows.length;
+      const payoutCount = payoutRows.length;
+      const listCount = listRows.length;
 
-    const medPayout = median(payoutVals);
-    const p10Payout = percentile(payoutVals, 0.1);
-    const p90Payout = percentile(payoutVals, 0.9);
+      const avgGmv = paidCount ? kpi.gmvUsd / paidCount : 0;
+      const avgPayout = payoutCount ? kpi.payoutCny / payoutCount : 0;
+      const avgProfit = payoutCount ? kpi.totalProfit / payoutCount : 0;
 
-    const medProfit = median(profitVals);
-    const p10Profit = percentile(profitVals, 0.1);
-    const p90Profit = percentile(profitVals, 0.9);
+      const payoutVals = payoutRows.map((r) => r.payoutCny || 0).filter((x) => x > 0);
+      const profitVals = payoutRows.map((r) => calculators.profitOf(r)).filter((x) => Number.isFinite(x) && x !== 0);
 
-    // 回款状态 Top3
-    const statusCount = new Map<string, number>();
-    baseRows.forEach((r) => {
-      const s = (r.payoutStatus || "未知").trim() || "未知";
-      statusCount.set(s, (statusCount.get(s) ?? 0) + 1);
-    });
-    const statusTop = Array.from(statusCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3);
+      const medPayout = median(payoutVals);
+      const p10Payout = percentile(payoutVals, 0.1);
+      const p90Payout = percentile(payoutVals, 0.9);
 
-    // 单条覆盖统计
-    const overrideKeys = Object.keys(rowCostOverride);
-    const overrideCountAll = overrideKeys.length;
+      const medProfit = median(profitVals);
+      const p10Profit = percentile(profitVals, 0.1);
+      const p90Profit = percentile(profitVals, 0.9);
 
-    let overrideCountInView = 0;
-    let profitDeltaSum = 0;
-    payoutRows.forEach((r) => {
-      const id = rowId(r);
-      if (Number.isFinite(rowCostOverride[id])) {
-        overrideCountInView += 1;
-        profitDeltaSum += calculators.profitOf(r) - calculators.profitOfDefault(r);
+      // 回款周期（天）：仅统计 paidAt 与 payoutAt 都存在的订单
+      const delays = payoutRows
+        .map((r) => {
+          if (!r.paidAt || !r.payoutAt) return NaN;
+          const d = Math.round((endOfDay(r.payoutAt).getTime() - endOfDay(r.paidAt).getTime()) / (24 * 3600 * 1000));
+          return Number.isFinite(d) ? d : NaN;
+        })
+        .filter((x) => Number.isFinite(x) && x >= 0) as number[];
+
+      const medDelay = median(delays);
+      const p90Delay = percentile(delays, 0.9);
+
+      // 待回款（付款在范围内，但未回款）
+      const awaitingRows = paidRows.filter((r) => !!r.paidAt && !r.payoutAt);
+      const awaitingCount = awaitingRows.length;
+      const awaitingGmv = awaitingRows.reduce((s, r) => s + (r.gmvUsd || 0), 0);
+
+      // 状态分布（基础口径）
+      const statusCount = new Map<string, number>();
+      baseRows.forEach((r) => {
+        const s = (r.payoutStatus || "未知").trim() || "未知";
+        statusCount.set(s, (statusCount.get(s) ?? 0) + 1);
+      });
+      const statusSorted = Array.from(statusCount.entries()).sort((a, b) => b[1] - a[1]);
+      const statusTop = statusSorted.slice(0, 3);
+
+      const statusLine = statusTop.length
+        ? `回款状态Top3（基础口径）：${statusTop.map(([s, c]) => `${s}(${c})`).join("、")}${statusSorted.length > 3 ? `（共${statusSorted.length}类）` : ""}`
+        : "回款状态Top3（基础口径）：无";
+
+      // 分类聚合（付款口径：GMV；回款口径：回款/利润/lot）
+      type GStat = { countPaid: number; countPayout: number; gmv: number; payout: number; profit: number; lots: number };
+      const gmap = new Map<string, GStat>();
+      const ensure = (g: string) => {
+        if (!gmap.has(g)) gmap.set(g, { countPaid: 0, countPayout: 0, gmv: 0, payout: 0, profit: 0, lots: 0 });
+        return gmap.get(g)!;
+      };
+
+      paidRows.forEach((r) => {
+        const g = (r.titleGroup || "Other").trim() || "Other";
+        const st = ensure(g);
+        st.countPaid += 1;
+        st.gmv += r.gmvUsd || 0;
+      });
+
+      payoutRows.forEach((r) => {
+        const g = (r.titleGroup || "Other").trim() || "Other";
+        const st = ensure(g);
+        st.countPayout += 1;
+        st.payout += r.payoutCny || 0;
+        st.profit += calculators.profitOf(r);
+        st.lots += calculators.lotCountOf(r);
+      });
+
+      const groups = Array.from(gmap.entries()).map(([group, v]) => ({ group, ...v }));
+
+      const topProfit = top10.profit[0];
+      const topPayout = top10.payout[0];
+      const topGmv = top10.gmv[0];
+
+      const bestMargin = groups
+        .filter((x) => x.payout > 0 && x.countPayout >= 3)
+        .map((x) => ({ ...x, margin: x.profit / x.payout }))
+        .sort((a, b) => b.margin - a.margin)[0];
+
+      const worstMargin = groups
+        .filter((x) => x.payout > 0 && x.countPayout >= 3)
+        .map((x) => ({ ...x, margin: x.profit / x.payout }))
+        .sort((a, b) => a.margin - b.margin)[0];
+
+      const otherCount = baseRows.filter((r) => (r.titleGroup || "Other") === "Other").length;
+
+      // 异常：负利润订单（回款口径）
+      const negRows = payoutRows
+        .map((r) => ({ r, p: calculators.profitOf(r) }))
+        .filter((x) => x.p < 0)
+        .sort((a, b) => a.p - b.p);
+      const negCount = negRows.length;
+      const negSum = negRows.reduce((s, x) => s + x.p, 0);
+
+      const worstNeg3 = negRows.slice(0, 3).map((x) => {
+        const sku = x.r.sku ? `SKU:${x.r.sku}` : "SKU:—";
+        const name = (x.r.name || "").slice(0, 38) + ((x.r.name || "").length > 38 ? "…" : "");
+        return `${sku} ${name}（¥${money(x.p)}）`;
+      });
+
+      // 异常：回款延迟 Top3（天）
+      const delayTop3 = payoutRows
+        .map((r) => {
+          if (!r.paidAt || !r.payoutAt) return null;
+          const d = Math.round((endOfDay(r.payoutAt).getTime() - endOfDay(r.paidAt).getTime()) / (24 * 3600 * 1000));
+          if (!Number.isFinite(d) || d < 0) return null;
+          return { r, d };
+        })
+        .filter(Boolean) as Array<{ r: Row; d: number }>;
+      delayTop3.sort((a, b) => b.d - a.d);
+      const slow3 = delayTop3.slice(0, 3).map((x) => {
+        const name = (x.r.name || "").slice(0, 34) + ((x.r.name || "").length > 34 ? "…" : "");
+        return `${x.d}天：${x.r.titleGroup || "Other"} / ${name}`;
+      });
+
+      // 时间序列对比：最近 N 天 vs 前 N 天（N=3~7）
+      const tailCompare = (series: DailyPoint[], n: number) => {
+        if (series.length < n * 2) return null;
+        let cur = 0;
+        let prev = 0;
+        for (let i = series.length - n; i < series.length; i++) cur += series[i]?.value || 0;
+        for (let i = series.length - n * 2; i < series.length - n; i++) prev += series[i]?.value || 0;
+        const delta = cur - prev;
+        const pct = prev !== 0 ? delta / prev : null;
+        return { cur, prev, delta, pct };
+      };
+
+      const n = Math.min(7, Math.max(3, Math.floor(Math.min(gmvSeries.length, payoutSeries.length, profitSeries.length) / 2)));
+      const gmvCmp = tailCompare(gmvSeries, n);
+      const payoutCmp = tailCompare(payoutSeries, n);
+      const profitCmp = tailCompare(profitSeries, n);
+
+      const fmtPct = (x: number | null) => (x === null ? "—" : `${(x * 100).toFixed(1)}%`);
+      const fmtDelta = (x: number) => `${x >= 0 ? "+" : ""}${money(x)}`;
+
+      // 单条覆盖统计
+      const overrideKeys = Object.keys(rowCostOverride);
+      const overrideCountAll = overrideKeys.length;
+
+      let overrideCountInView = 0;
+      let profitDeltaSum = 0;
+
+      const overrideImpact = payoutRows
+        .map((r) => {
+          const id = rowId(r);
+          const hasOverride = Number.isFinite(rowCostOverride[id]);
+          if (!hasOverride) return null;
+          const delta = calculators.profitOf(r) - calculators.profitOfDefault(r);
+          return { r, delta };
+        })
+        .filter(Boolean) as Array<{ r: Row; delta: number }>;
+      overrideImpact.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+      const overrideTop3 = overrideImpact.slice(0, 3).map((x) => {
+        const name = (x.r.name || "").slice(0, 36) + ((x.r.name || "").length > 36 ? "…" : "");
+        return `${x.r.titleGroup || "Other"} / ${name}（利润变化 ¥${fmtDelta(x.delta)}）`;
+      });
+
+      payoutRows.forEach((r) => {
+        const id = rowId(r);
+        if (Number.isFinite(rowCostOverride[id])) {
+          overrideCountInView += 1;
+          profitDeltaSum += calculators.profitOf(r) - calculators.profitOfDefault(r);
+        }
+      });
+
+      // 数据质量提示
+      const missingPaidAt = baseRows.filter((r) => !r.paidAt).length;
+      const missingPayoutAtWithAmount = baseRows.filter((r) => (r.payoutCny || 0) > 0 && !r.payoutAt).length;
+      const missingPayoutAmountWithDate = baseRows.filter((r) => !!r.payoutAt && !(r.payoutCny > 0)).length;
+
+      const summary =
+        `范围：付款[${paidRange}]，回款[${payoutRange}]。` +
+        ` 行数：基础${baseCount}；明细(双日期交集)${listCount}；付款${paidCount}；回款${payoutCount}。` +
+        ` GMV(付款) $${money(kpi.gmvUsd)}（AOV $${money(avgGmv)}）；回款(回款) ¥${money(kpi.payoutCny)}（¥${money(avgPayout)}/单）；` +
+        ` 利润 ¥${money(kpi.totalProfit)}（利润率 ${(kpi.margin * 100).toFixed(1)}%，¥${money(avgProfit)}/单）。`;
+
+      const highlights: string[] = [];
+
+      if (topProfit) {
+        const share = kpi.totalProfit !== 0 ? topProfit.value / kpi.totalProfit : 0;
+        highlights.push(`利润Top1：${topProfit.group}（¥${money(topProfit.value)}，占比约 ${(share * 100).toFixed(1)}%）`);
       }
-    });
+      if (topPayout) highlights.push(`回款Top1：${topPayout.group}（¥${money(topPayout.value)}）`);
+      if (topGmv) highlights.push(`GMV Top1：${topGmv.group}（$${money(topGmv.value)}）`);
 
-    const summary =
-      `当前筛选：GMV(付款口径) $${money(kpi.gmvUsd)}；回款(回款口径) ¥${money(kpi.payoutCny)}；` +
-      `利润 ¥${money(kpi.totalProfit)}（利润率 ${(kpi.margin * 100).toFixed(1)}%）。`;
+      if (bestMargin) highlights.push(`最佳毛利（≥3单）：${bestMargin.group}（毛利率 ${(bestMargin.margin * 100).toFixed(1)}%）`);
+      if (worstMargin) highlights.push(`最低毛利（≥3单）：${worstMargin.group}（毛利率 ${(worstMargin.margin * 100).toFixed(1)}%）`);
 
-    const highlights: string[] = [];
-    if (topProfit) highlights.push(`利润Top1：${topProfit.group}（¥${money(topProfit.value)}）`);
-    if (topPayout) highlights.push(`回款Top1：${topPayout.group}（¥${money(topPayout.value)}）`);
-    if (topGmv) highlights.push(`GMV Top1：${topGmv.group}（$${money(topGmv.value)}）`);
+      if (payoutVals.length >= 10) highlights.push(`回款分布：P10=¥${money(p10Payout)} / 中位=¥${money(medPayout)} / P90=¥${money(p90Payout)}`);
+      if (profitVals.length >= 10) highlights.push(`利润分布：P10=¥${money(p10Profit)} / 中位=¥${money(medProfit)} / P90=¥${money(p90Profit)}`);
+      if (delays.length >= 10) highlights.push(`回款周期：中位 ${medDelay} 天 / P90 ${p90Delay} 天`);
 
-    if (payoutVals.length >= 10) highlights.push(`回款分布：P10=¥${money(p10Payout)} / 中位=¥${money(medPayout)} / P90=¥${money(p90Payout)}`);
-    if (profitVals.length >= 10) highlights.push(`利润分布：P10=¥${money(p10Profit)} / 中位=¥${money(medProfit)} / P90=¥${money(p90Profit)}`);
+      if (gmvCmp && payoutCmp && profitCmp) {
+        highlights.push(
+          `近期${n}天 vs 前${n}天：GMV $${money(gmvCmp.cur)}（${fmtPct(gmvCmp.pct)}）；回款 ¥${money(payoutCmp.cur)}（${fmtPct(payoutCmp.pct)}）；利润 ¥${money(profitCmp.cur)}（${fmtPct(profitCmp.pct)}）`
+        );
+      }
 
-    const risks: string[] = [];
-    if (kpi.payoutCny > 0 && kpi.margin < 0.1) risks.push("整体利润率偏低（<10%），注意成本或低价出货风险。");
-    if (kpi.totalProfit < 0) risks.push("当前筛选利润为负，请优先排查异常成本/低价订单。");
-    if (otherRows.length > 0) risks.push(`存在未命中分类规则的“Other”订单（${otherRows.length} 行展示），建议补充分类规则。`);
-    if (overrideCountInView > 0) risks.push(`本筛选视图内有 ${overrideCountInView} 条单条成本覆盖，利润合计变化 ¥${money(profitDeltaSum)}。`);
+      const risks: string[] = [];
 
-    const actions: string[] = [];
-    if (topProfit) actions.push(`加大高利润组：优先复盘【${topProfit.group}】的供货与定价策略。`);
-    if (kpi.payoutCny > 0 && kpi.margin < 0.15) actions.push("尝试：提高高毛利品占比 / 复查成本默认值 / 对低毛利组做限价。");
-    if (otherRows.length > 0) actions.push("把 Other 清单中高频关键词沉淀为规则（建议用“规则数组+优先级”维护）。");
-    if (overrideCountAll === 0) actions.push("如遇特殊成本：可在订单明细里用“单条成本¥/lot”覆盖，不影响分类默认成本");
-    else actions.push("单条成本覆盖：建议定期清理（清空后重新按分类默认成本口径回算）。");
+      if (kpi.payoutCny > 0 && kpi.margin < 0.1) risks.push("整体利润率偏低（<10%），注意成本口径或低价出货风险。");
+      if (kpi.totalProfit < 0) risks.push("当前回款口径利润为负，请优先排查异常成本/低价订单。");
 
-    const statusLine = statusTop.length ? `回款状态Top3：${statusTop.map(([s, c]) => `${s}(${c})`).join("、")}` : "回款状态Top3：无";
+      if (negCount > 0) risks.push(`存在负利润订单：${negCount} 单，合计 ¥${money(negSum)}（见最差Top3）。`);
+      if (awaitingCount > 0) risks.push(`存在待回款：付款范围内 ${awaitingCount} 单未回款（GMV约 $${money(awaitingGmv)}）。`);
 
-    const note = "口径说明：GMV 按【付款时间】筛选聚合；回款/利润按【回款时间】筛选聚合（两套时间范围互不影响）。";
+      if (otherCount > 0) risks.push(`分类命中不足：Other 共 ${otherCount} 行（建议补充分类规则）。`);
+      if (overrideCountInView > 0) risks.push(`本视图内有 ${overrideCountInView} 条单条成本覆盖，利润合计变化 ¥${fmtDelta(profitDeltaSum)}。`);
 
-    const copyText =
-      `【自动分析报告】\n` +
-      `${summary}\n` +
-      `${statusLine}\n` +
-      `\n` +
-      `【亮点】\n- ${highlights.length ? highlights.join("\n- ") : "暂无"}\n\n` +
-      `【风险】\n- ${risks.length ? risks.join("\n- ") : "暂无"}\n\n` +
-      `【建议动作】\n- ${actions.length ? actions.join("\n- ") : "暂无"}\n\n` +
-      `${note}\n` +
-      `\n` +
-      `单条成本覆盖：全局共 ${overrideCountAll} 条（本筛选视图内影响已统计）。`;
+      // 集中度风险：Top1 利润占比过高
+      if (topProfit && kpi.totalProfit !== 0 && Math.abs(topProfit.value / kpi.totalProfit) > 0.6) risks.push("利润集中度较高（Top1 > 60%），注意对单一品类/标题组依赖。");
+      if (payoutVals.length >= 10 && medPayout > 0 && p90Payout / medPayout >= 5) risks.push("回款分布长尾明显（P90 >> 中位），可能存在少量大额订单拉动。");
 
-    return { summary, highlights, risks, actions, statusLine, note, copyText };
-  }, [top10, baseRows, payoutRows, kpi, rowCostOverride, costMap, calculators, otherRows.length]);
+      if (missingPayoutAtWithAmount > 0) risks.push(`数据异常：存在 ${missingPayoutAtWithAmount} 行“有回款金额但无回款时间”。`);
+      if (missingPayoutAmountWithDate > 0) risks.push(`数据异常：存在 ${missingPayoutAmountWithDate} 行“有回款时间但回款金额为空/0”。`);
+      if (missingPaidAt > 0 && baseCount > 0 && missingPaidAt / baseCount > 0.3) risks.push("付款时间缺失比例较高（>30%），趋势与对比可能失真。");
 
+      const actions: string[] = [];
+
+      if (topProfit) actions.push(`复盘并扩量：重点关注【${topProfit.group}】的供货与定价策略（高利润贡献）。`);
+      if (bestMargin) actions.push(`提升结构：适当提高【${bestMargin.group}】占比，减少低毛利组占比。`);
+      if (worstMargin && worstMargin.margin < 0.05) actions.push(`治理低毛利：针对【${worstMargin.group}】复查成本默认值/定价，必要时设最低价或暂停。`);
+
+      if (negCount > 0) actions.push(`逐单排查：先看负利润Top3，核对成本(lot)与标题解析(lot数)，必要时用“单条成本覆盖”修正。`);
+      if (slow3.length) actions.push("回款提速：关注延迟Top3订单的状态与渠道，考虑优化回款路径/结算频率。");
+      if (awaitingCount > 0) actions.push("跟进待回款：按回款状态筛出“处理中/待处理”订单，设置催款/对账节奏。");
+
+      if (otherCount > 0) actions.push("补齐分类：将 Other 订单的高频关键词沉淀为规则（建议用优先级规则数组维护）。");
+
+      if (overrideCountAll === 0) actions.push("如遇特殊成本：可在订单明细里用“单条成本¥/lot”覆盖（不影响分类默认成本）。");
+      else actions.push("单条成本覆盖：建议定期整理成新的分类默认成本，避免覆盖长期堆积导致口径分裂。");
+
+      const note =
+        "口径说明：GMV 按【付款时间】筛选聚合；回款/利润按【回款时间】筛选聚合（两套时间范围互不影响）。" +
+        ` 当前范围：付款[${paidRange}]；回款[${payoutRange}]。`;
+
+      const copyText =
+        `【自动分析报告】\n` +
+        `${summary}\n` +
+        `${statusLine}\n` +
+        `\n` +
+        `【亮点】\n- ${highlights.length ? highlights.join("\n- ") : "暂无"}\n\n` +
+        `【风险】\n- ${risks.length ? risks.join("\n- ") : "暂无"}\n\n` +
+        `【建议动作】\n- ${actions.length ? actions.join("\n- ") : "暂无"}\n\n` +
+        `【异常Top】\n` +
+        `- 负利润Top3：${worstNeg3.length ? worstNeg3.join("；") : "暂无"}\n` +
+        `- 回款延迟Top3：${slow3.length ? slow3.join("；") : "暂无"}\n` +
+        `\n` +
+        `${note}\n` +
+        `\n` +
+        `单条成本覆盖：全局共 ${overrideCountAll} 条；本视图内影响 ¥${fmtDelta(profitDeltaSum)}。\n` +
+        `${overrideTop3.length ? `覆盖影响Top3：\n- ${overrideTop3.join("\n- ")}\n` : ""}`;
+
+      return { summary, highlights, risks, actions, statusLine, note, copyText };
+    }, [
+      top10,
+      baseRows,
+      paidRows,
+      payoutRows,
+      listRows,
+      kpi,
+      rowCostOverride,
+      calculators,
+      gmvSeries,
+      payoutSeries,
+      profitSeries,
+      filters.paidStartYmd,
+      filters.paidEndYmd,
+      filters.payoutStartYmd,
+      filters.payoutEndYmd,
+    ]);
   /** 明细：排序 + 分页（全局 reducer 状态驱动） */
   const sortedListRows = useMemo(() => {
     const arr = [...listRows];
